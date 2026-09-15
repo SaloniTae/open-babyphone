@@ -55,6 +55,17 @@ class ListenResumeActivityTest {
     }
 
     @Test
+    fun `launcher resume route retains the active trusted identity for retry`() {
+        val identity = ExpectedChildIdentity("child1", "pair1")
+        ActiveListenSessionRegistry.register(identity, "request")
+
+        assertEquals(
+            Listen("request", "child1", "pair1", resumeOnly = true),
+            activeListenRoute()
+        )
+    }
+
+    @Test
     fun `stopped trusted notification creates internal retry request`() {
         withTrustedChild { store ->
             val token = ActiveListenSessionRegistry.register(

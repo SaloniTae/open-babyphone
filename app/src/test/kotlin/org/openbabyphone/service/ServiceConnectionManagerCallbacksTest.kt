@@ -13,6 +13,7 @@ import org.openbabyphone.ExpectedChildIdentity
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
 import org.junit.Before
@@ -133,6 +134,58 @@ class ServiceConnectionManagerCallbacksTest {
         ServiceConnectionManager.disposeServiceBinding(context, binding)
 
         assertNull("Resume listen binding must not stop service on dispose", shadowOf(context).nextStoppedService)
+    }
+
+    @Test
+    fun `disposing an older binding preserves newer listen callbacks`() {
+        val identity = ExpectedChildIdentity("child", "pairing")
+        ActiveListenSessionRegistry.register(identity, "request")
+        ListenServiceRepository.startConnecting("Nursery")
+        val connections = mutableListOf<ServiceConnection>()
+        val recordingContext = object : ContextWrapper(context) {
+            override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean {
+                connections += conn
+                return true
+            }
+
+            override fun unbindService(conn: ServiceConnection) = Unit
+        }
+        val controller = Robolectric.buildService(ListenService::class.java).create()
+        val service = controller.get()
+        val viewModel = org.openbabyphone.viewmodel.ListenViewModel(context)
+
+        val first = ServiceConnectionManager.bindListenService(
+            recordingContext,
+            viewModel,
+            "request",
+            identity.childId,
+            identity.pairingId,
+            resumeOnly = true
+        )
+        connections[0].onServiceConnected(
+            ComponentName(context, ListenService::class.java),
+            service.onBind(Intent())
+        )
+        val second = ServiceConnectionManager.bindListenService(
+            recordingContext,
+            viewModel,
+            "request",
+            identity.childId,
+            identity.pairingId,
+            resumeOnly = true
+        )
+        connections[1].onServiceConnected(
+            ComponentName(context, ListenService::class.java),
+            service.onBind(Intent())
+        )
+        val newerUpdate = service.onUpdate
+
+        ServiceConnectionManager.disposeServiceBinding(recordingContext, first)
+
+        assertSame(newerUpdate, service.onUpdate)
+        ServiceConnectionManager.disposeServiceBinding(recordingContext, second)
+        assertNull(service.onUpdate)
+        controller.destroy()
     }
 
     @Test
@@ -304,6 +357,31 @@ class ServiceConnectionManagerCallbacksTest {
 
         assertFalse(binding.bound)
         assertEquals(0, startCount)
+    }
+
+    @Test
+    fun `unavailable active resume publishes retryable error`() {
+        ActiveListenSessionRegistry.register(ExpectedChildIdentity("child", "pairing"), "request")
+        ListenServiceRepository.startConnecting("Nursery")
+        val unavailableContext = object : ContextWrapper(context) {
+            override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean = false
+        }
+
+        val binding = ServiceConnectionManager.bindListenService(
+            unavailableContext,
+            org.openbabyphone.viewmodel.ListenViewModel(context),
+            requestId = "request",
+            expectedChildId = "child",
+            expectedPairingId = "pairing",
+            resumeOnly = true
+        )
+
+        assertFalse(binding.bound)
+        assertTrue(ListenServiceRepository.sessionState.value is ListenSessionState.Error)
+        assertEquals(
+            ListenSessionError.Unreachable,
+            (ListenServiceRepository.sessionState.value as ListenSessionState.Error).type
+        )
     }
 
     @Test

@@ -96,7 +96,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             LauncherDestination.Start -> Start
                             LauncherDestination.Monitor -> Monitor
-                            LauncherDestination.Listen -> Listen(resumeOnly = true)
+                            LauncherDestination.Listen -> activeListenRoute()
                         }
                     }
                     LaunchedEffect(navController) {
@@ -118,7 +118,7 @@ class MainActivity : ComponentActivity() {
                                     LauncherDestination.Monitor -> navigateToActiveMonitor(navController)
                                     LauncherDestination.Listen -> navigateToInternalListen(
                                         navController,
-                                        Listen(resumeOnly = true)
+                                        activeListenRoute()
                                     )
                                 }
                             }
@@ -305,6 +305,17 @@ internal fun navigateFromStoppedMonitor(navController: NavHostController) {
             launchSingleTop = true
         }
     }
+}
+
+internal fun activeListenRoute(): Listen {
+    val session = ActiveListenSessionRegistry.activeSession()
+    val identity = session?.identity
+    return Listen(
+        requestId = session?.requestId.orEmpty(),
+        expectedChildId = identity?.childId.orEmpty(),
+        expectedPairingId = identity?.pairingId.orEmpty(),
+        resumeOnly = true
+    )
 }
 
 internal fun navigateFromStoppedListen(navController: NavHostController) {

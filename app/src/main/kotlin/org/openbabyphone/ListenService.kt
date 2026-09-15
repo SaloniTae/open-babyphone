@@ -411,6 +411,11 @@ class ListenService : Service() {
         onStatusChange = null
     }
 
+    fun clearCallbacksOwnedBy(update: () -> Unit, error: () -> Unit) {
+        if (onUpdate === update) onUpdate = null
+        if (onError === error) onError = null
+    }
+
     private val reconnectBackoff = ReconnectBackoff()
     private val reconnectWakeSignal = ReconnectWakeSignal()
 

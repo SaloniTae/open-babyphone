@@ -86,6 +86,15 @@ object ServiceConnectionManager {
         }
 
         var serviceRef: WeakReference<ListenService>? = null
+        var updateCallback: (() -> Unit)? = null
+        var errorCallback: (() -> Unit)? = null
+        val clearOwnedCallbacks: () -> Unit = {
+            val update = updateCallback
+            val error = errorCallback
+            if (update != null && error != null) {
+                serviceRef?.get()?.clearCallbacksOwnedBy(update, error)
+            }
+        }
 
         val connection = object : ServiceConnection {
             override fun onServiceConnected(className: ComponentName, service: IBinder) {
@@ -94,23 +103,24 @@ object ServiceConnectionManager {
                 val listenService = binder.service
                 serviceRef = WeakReference(listenService)
 
-                // Set up callbacks to update ViewModel
-                listenService.onUpdate = {
+                val update = {
                     val floatHistory = FloatArray(listenService.volumeHistory.size()) { i ->
                         listenService.volumeHistory[i].toFloat().coerceAtLeast(0f).coerceAtMost(1f)
                     }
                     val volumeNorm = listenService.volumeHistory.volumeNorm.toFloat()
                     viewModel.updateVolumeHistory(floatHistory, volumeNorm)
                 }
-
-                listenService.onError = {
-                    // Error handled by Repository
-                }
+                val error = { }
+                updateCallback = update
+                errorCallback = error
+                listenService.onUpdate = update
+                listenService.onError = error
+                update()
             }
 
             override fun onServiceDisconnected(className: ComponentName) {
                 _listenServiceConnected.value = false
-                serviceRef?.get()?.clearCallbacks()
+                clearOwnedCallbacks()
                 serviceRef = null
             }
         }
@@ -157,11 +167,14 @@ object ServiceConnectionManager {
                 }
             }
         }
+        if (!bound && resumeOnly && ListenServiceRepository.sessionState.value.isAuthoritativelyActive()) {
+            publishListenStartupFailure(context)
+        }
         return ServiceBinding(
             intent = intent,
             connection = connection,
             bound = bound,
-            clearCallbacks = { serviceRef?.get()?.clearCallbacks() }
+            clearCallbacks = clearOwnedCallbacks
         )
     }
 
