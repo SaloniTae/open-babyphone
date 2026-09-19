@@ -564,7 +564,7 @@ class MonitorService : Service() {
                 return@Thread
             }
 
-            startRelayLoop(sessionId, claim)
+            startRelayLoop(claim)
 
             while (isWorkerActive(claim) && this.connectionToken == currentToken) {
                 val portToBind = currentPort
@@ -650,7 +650,7 @@ class MonitorService : Service() {
         }
     }
 
-    private fun startRelayLoop(sessionId: ByteArray, claim: WorkerClaim) {
+    private fun startRelayLoop(claim: WorkerClaim) {
         val identity = childIdentityStore.identity
         val relaySession = RelaySessionId.derive(identity.childId, identity.pairingId)
         val thread = Thread {
