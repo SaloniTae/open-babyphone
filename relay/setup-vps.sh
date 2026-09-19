@@ -197,15 +197,24 @@ EOF
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 echo "[8/10] Installing only missing npm dependency..."
-NPM_CLI_JS="$NODE20_DIR/node_modules/npm/bin/npm-cli.js"
+NPM_CLI_JS=""
+for candidate in \
+  "$NODE20_DIR/lib/node_modules/npm/bin/npm-cli.js" \
+  "$NODE20_DIR/node_modules/npm/bin/npm-cli.js"; do
+  if [ -r "$candidate" ]; then
+    NPM_CLI_JS="$candidate"
+    break
+  fi
+done
+
 if [ -d "$APP_DIR/node_modules/ws" ]; then
   echo "Existing ws dependency found; no npm download."
-elif [ -r "$NPM_CLI_JS" ]; then
+elif [ -n "$NPM_CLI_JS" ]; then
   echo "ws is missing; running npm CLI directly with Node 20..."
   "$NODE20_BIN" "$NPM_CLI_JS" --prefix "$APP_DIR" install --omit=dev
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 else
-  die "Node 20 npm CLI was not found at $NPM_CLI_JS."
+  die "Node 20 npm CLI was not found. Checked the standard nvm npm locations."
 fi
 
 cat > "$SYSTEMD_UNIT" <<EOF
