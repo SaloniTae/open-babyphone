@@ -277,7 +277,7 @@ const wss = new WebSocketServer({
 wss.on("connection", (ws, _req, sessionId, role) => {
   let session = sessions.get(sessionId);
   if (!session) {
-    session = { child: null, parent: null };
+    session = createSession();
     sessions.set(sessionId, session);
   }
 
