@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Open Babyphone relay - one-time Ubuntu VPS setup
-# Existing software is checked first. Nothing is downloaded unless required.
-# Node.js 20 is selected only for this service using nvm when available,
-# otherwise the script installs/uses Node 20 without changing other apps.
-
 DOMAIN="babyphone.duckdns.org"
 APP_USER="babyphone-relay"
 APP_DIR="/opt/open-babyphone-relay"
@@ -16,6 +11,7 @@ SYSTEMD_UNIT="/etc/systemd/system/open-babyphone-relay.service"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [ "${EUID}" -eq 0 ] || die "Run this script as root."; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 echo "=== Open Babyphone relay VPS setup ==="
 echo "Domain : ${DOMAIN}"
@@ -24,108 +20,63 @@ echo
 
 need_root
 
-echo "[1/9] Checking existing software..."
+echo "[1/9] Verifying existing ports and software..."
+PORT80="$(ss -ltnp 2>/dev/null | grep -E ':(80)\b' || true)"
+PORT443="$(ss -ltnp 2>/dev/null | grep -E ':(443)\b' || true)"
+PORT8338="$(ss -ltnp 2>/dev/null | grep -E ':(8338)\b' || true)"
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+echo "80   : ${PORT80:-free}"
+echo "443  : ${PORT443:-free}"
+echo "8338 : ${PORT8338:-free}"
 
-if have_cmd node; then
-  echo "System Node: $(node --version)"
-else
-  echo "System Node: not installed"
+if [ -n "${PORT8338}" ]; then
+  die "Port 8338 is already in use. Nothing changed."
 fi
 
-if have_cmd nginx; then
-  echo "nginx: $(nginx -v 2>&1)"
-else
-  echo "nginx: not installed"
+if [ -n "${PORT80}" ] && ! echo "${PORT80}" | grep -q 'nginx'; then
+  die "Port 80 is occupied by a non-nginx process. Nothing changed."
 fi
 
-if have_cmd certbot; then
-  echo "certbot: $(certbot --version 2>&1)"
-else
-  echo "certbot: not installed"
+if [ -n "${PORT443}" ] && ! echo "${PORT443}" | grep -q 'nginx'; then
+  die "Port 443 is occupied by a non-nginx process. Nothing changed."
 fi
+
+have_cmd nginx || die "nginx is not installed. Nothing downloaded."
+have_cmd certbot || die "certbot is not installed. Nothing downloaded."
 
 echo
-echo "[2/9] Selecting Node.js 20 only for this relay..."
+echo "[2/9] Selecting existing Node.js 20 from nvm..."
+NVM_DIR="/root/.nvm"
+[ -s "${NVM_DIR}/nvm.sh" ] || die "nvm is not installed. Nothing downloaded."
 
-NODE20_BIN=""
+# shellcheck disable=SC1091
+source "${NVM_DIR}/nvm.sh"
 
-# Prefer nvm already installed for root.
-if [ -s "/root/.nvm/nvm.sh" ]; then
-  # shellcheck disable=SC1091
-  source "/root/.nvm/nvm.sh"
-  if nvm ls 20 >/dev/null 2>&1; then
-    nvm use 20 >/dev/null
-  else
-    echo "Node 20 is not installed in root nvm; installing only that nvm version..."
-    nvm install 20
-    nvm use 20
-  fi
-  NODE20_BIN="$(nvm which 20)"
-fi
+NODE20_BIN="$(nvm which 20 2>/dev/null || true)"
+[ -n "${NODE20_BIN}" ] && [ -x "${NODE20_BIN}" ] || die "Node.js 20 is not installed in nvm. Nothing downloaded. Run: nvm install 20"
 
-# Otherwise look for an existing node 20 binary.
-if [ -z "${NODE20_BIN}" ]; then
-  while IFS= read -r candidate; do
-    [ -x "${candidate}" ] || continue
-    major="$("${candidate}" -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
-    if [ "${major}" = "20" ]; then
-      NODE20_BIN="${candidate}"
-      break
-    fi
-  done < <(find /usr/local/bin /usr/bin /opt /root -type f -name node 2>/dev/null | head -200)
-fi
-
-# Install nvm + Node 20 only if no existing Node 20 was found.
-if [ -z "${NODE20_BIN}" ]; then
-  echo "No existing Node 20 found. Installing nvm + Node 20..."
-  export NVM_DIR="/root/.nvm"
-  if [ ! -s "${NVM_DIR}/nvm.sh" ]; then
-    apt-get update
-    apt-get install -y curl ca-certificates
-    curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-  fi
-  # shellcheck disable=SC1091
-  source "${NVM_DIR}/nvm.sh"
-  nvm install 20
-  nvm use 20
-  NODE20_BIN="$(nvm which 20)"
-fi
-
-[ -n "${NODE20_BIN}" ] || die "Could not find Node.js 20."
 NODE20_DIR="$(dirname "${NODE20_BIN}")"
-echo "Relay will use: ${NODE20_BIN}"
+echo "Using Node: ${NODE20_BIN}"
 "${NODE20_BIN}" --version
 
 echo
-echo "[3/9] Checking/installing nginx and certbot only when absent..."
-
-if ! have_cmd nginx || ! have_cmd certbot; then
-  apt-get update
-  if ! have_cmd nginx; then
-    apt-get install -y nginx
-  fi
-  if ! have_cmd certbot; then
-    apt-get install -y certbot
-  fi
-fi
+echo "[3/9] Verifying DNS..."
+RESOLVED_IP="$(getent hosts "${DOMAIN}" | awk 'NR==1{print $1}')"
+[ -n "${RESOLVED_IP}" ] || die "${DOMAIN} does not resolve."
+echo "${DOMAIN} -> ${RESOLVED_IP}"
 
 echo
-echo "[4/9] Creating dedicated relay account and directory..."
-
-if ! id -u "${APP_USER}" >/dev/null 2>&1; then
-  useradd --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
+echo "[4/9] Checking existing relay installation..."
+mkdir -p "${APP_DIR}"
+if id -u "${APP_USER}" >/dev/null 2>&1; then
+  echo "Relay user already exists; keeping it."
 else
-  echo "User ${APP_USER} already exists; keeping it."
+  useradd --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
 fi
-
-mkdir -p "${APP_DIR}" "${ACME_WEBROOT}"
 chown -R "${APP_USER}":"${APP_USER}" "${APP_DIR}"
 
 echo
-echo "[5/9] Writing relay application..."
-
+echo "[5/9] Installing relay application files..."
 cat > "${APP_DIR}/package.json" <<'EOF'
 {
   "name": "open-babyphone-relay",
@@ -205,6 +156,7 @@ wss.on("connection", (ws, _req, sessionId, role) => {
 server.on("upgrade", (req, socket, head) => {
   try {
     const url = new URL(req.url, "http://relay.invalid");
+
     if (url.pathname !== "/relay") {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
@@ -236,24 +188,20 @@ EOF
 chown -R "${APP_USER}":"${APP_USER}" "${APP_DIR}"
 
 echo
-echo "[6/9] Installing npm dependency only if it is missing..."
-
+echo "[6/9] Checking npm dependency..."
 cd "${APP_DIR}"
-if [ ! -d "${APP_DIR}/node_modules/ws" ]; then
-  # Run npm with Node 20 specifically.
-  export PATH="${NODE20_DIR}:${PATH}"
-  if [ "${NODE20_BIN}" = "/usr/bin/node" ]; then
-    echo "Using existing system Node 20."
-  fi
-  sudo -u "${APP_USER}" env PATH="${NODE20_DIR}:/usr/local/bin:/usr/bin:/bin" npm install --omit=dev
+
+if [ -d "${APP_DIR}/node_modules/ws" ]; then
+  echo "Existing ws dependency found; no npm download."
 else
-  echo "ws is already installed; skipping npm download."
+  echo "ws is missing; installing it with Node 20..."
+  NPM_BIN="${NODE20_DIR}/npm"
+  [ -x "${NPM_BIN}" ] || die "npm for Node 20 was not found at ${NPM_BIN}."
+  sudo -u "${APP_USER}" env PATH="${NODE20_DIR}:/usr/local/bin:/usr/bin:/bin" "${NPM_BIN}" install --omit=dev
 fi
 
 echo
-echo "[7/9] Installing/updating systemd unit for the relay..."
-
-NODE20_EXEC="${NODE20_BIN}"
+echo "[7/9] Installing relay systemd service..."
 cat > "${SYSTEMD_UNIT}" <<EOF
 [Unit]
 Description=Open Babyphone Internet Relay
@@ -268,7 +216,7 @@ WorkingDirectory=${APP_DIR}
 Environment=NODE_ENV=production
 Environment=PORT=${PORT}
 Environment=PATH=${NODE20_DIR}:/usr/local/bin:/usr/bin:/bin
-ExecStart=${NODE20_EXEC} ${APP_DIR}/server.js
+ExecStart=${NODE20_BIN} ${APP_DIR}/server.js
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
@@ -284,10 +232,15 @@ EOF
 
 systemctl daemon-reload
 systemctl enable open-babyphone-relay.service
-systemctl restart open-babyphone-relay.service
 
 echo
-echo "[8/9] Configuring nginx + Let's Encrypt..."
+echo "[8/9] Adding nginx configuration without touching other nginx sites..."
+mkdir -p "${ACME_WEBROOT}" /etc/nginx/sites-enabled
+
+# Refuse to replace a different pre-existing file.
+if [ -e "${NGINX_SITE}" ] && ! grep -q 'server_name babyphone\.duckdns\.org;' "${NGINX_SITE}"; then
+  die "${NGINX_SITE} already exists and is not recognized as the Babyphone config. Nothing changed."
+fi
 
 cat > "${NGINX_SITE}" <<EOF
 server {
@@ -333,47 +286,37 @@ server {
 }
 EOF
 
-mkdir -p /etc/nginx/sites-enabled
 ln -sf "${NGINX_SITE}" /etc/nginx/sites-enabled/babyphone-relay
-rm -f /etc/nginx/sites-enabled/default
 
+# Do not remove the existing default nginx site.
 nginx -t
 
-# Certificate only if this exact certificate is missing.
-if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
-  echo "Certificate for ${DOMAIN} is missing; requesting it now..."
-  systemctl reload nginx
-  certbot certonly --webroot -w "${ACME_WEBROOT}" -d "${DOMAIN}"     --agree-tos --register-unsafely-without-email --non-interactive
-else
-  echo "Existing Let's Encrypt certificate found; skipping certificate download."
+CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+if [ ! -f "${CERT}" ]; then
+  echo
+  echo "No existing Let's Encrypt certificate was found for ${DOMAIN}."
+  echo "I am stopping before changing nginx/restarting services."
+  echo "Next step will be certificate setup after checking your existing nginx configuration."
+  exit 2
 fi
 
-nginx -t
+echo
+echo "[9/9] Starting only Babyphone relay and reloading nginx..."
+systemctl restart open-babyphone-relay.service
 systemctl reload nginx
 
 echo
-echo "[9/9] Checking firewall without resetting existing rules..."
-
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
-fi
-
-echo
 echo "=== Verification ==="
-echo "Node used by relay:"
 "${NODE20_BIN}" --version
-echo
-echo "Relay service:"
-systemctl --no-pager --full status open-babyphone-relay.service || true
-echo
-echo "Local health:"
+echo "Local relay:"
 curl -fsS "http://127.0.0.1:${PORT}/healthz"
 echo
-echo "Public health:"
+echo "Public relay:"
 curl -fsS "https://${DOMAIN}/healthz"
 echo
+systemctl --no-pager --full status open-babyphone-relay.service
+
+echo
 echo "WSS endpoint: wss://${DOMAIN}/relay"
-echo "Local relay port: ${PORT}"
-echo "Other applications using Node 18/other Node versions were not changed."
+echo "Relay port: ${PORT}"
+echo "Node 18 remains untouched."
