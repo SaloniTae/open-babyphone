@@ -380,7 +380,6 @@ class MonitorService : Service() {
                     handleAudioProducerFailure(unexpectedFailure, claim)
                 }
             }
-            startRelayLoop(sessionId, claim)
         }
         synchronized(sessionStateLock) {
             if (!isWorkerActive(claim)) {
