@@ -7,10 +7,8 @@ object RelayConfig {
     private const val KEY_URL = "url"
     private const val KEY_TOKEN = "token"
 
-    // Set these values before building the production APK, or replace this
-    // object with a settings-backed configuration.
-    private const val DEFAULT_URL = "wss://YOUR-DUCKDNS-HOST/relay"
-    private const val DEFAULT_TOKEN = ""
+    private const val DEFAULT_URL = BuildConfig.DEFAULT_RELAY_URL
+    private const val DEFAULT_TOKEN = BuildConfig.DEFAULT_RELAY_TOKEN
 
     fun url(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
