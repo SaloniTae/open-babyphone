@@ -23,6 +23,7 @@ import org.openbabyphone.PairingQrCode
 import org.openbabyphone.PendingConnection
 import org.openbabyphone.PendingConnectionStore
 import org.openbabyphone.PendingConnections
+import org.openbabyphone.RelaySessionId
 import org.openbabyphone.TrustedChild
 import org.openbabyphone.TrustedChildStore
 import org.openbabyphone.trustedChildStore
