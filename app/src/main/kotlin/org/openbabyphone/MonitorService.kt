@@ -380,6 +380,7 @@ class MonitorService : Service() {
                     handleAudioProducerFailure(unexpectedFailure, claim)
                 }
             }
+            startRelayLoop(sessionId, claim)
         }
         synchronized(sessionStateLock) {
             if (!isWorkerActive(claim)) {
@@ -596,7 +597,6 @@ class MonitorService : Service() {
                     val localPort = it.localPort
                     registerService(localPort, claim)
                     startAudioProducer(claim)
-                    startRelayLoop(sessionId, claim)
 
                     while (isWorkerActive(claim) && this.connectionToken == currentToken &&
                         !Thread.currentThread().isInterrupted
@@ -788,6 +788,18 @@ class MonitorService : Service() {
             }
         }
         monitorThread = null
+        relayThread?.let { thread ->
+            thread.interrupt()
+            relaySocket?.let { closeSocket(it, "relay socket") }
+            if (thread !== Thread.currentThread()) {
+                try {
+                    thread.join(1000)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+        relayThread = null
         audioProducerThread?.let { thread ->
             thread.interrupt()
             if (thread !== Thread.currentThread()) {
