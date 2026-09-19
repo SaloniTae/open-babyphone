@@ -180,29 +180,21 @@ class DiscoverViewModel @JvmOverloads constructor(
                         pairingCode = PairingCode.normalize(parsed.pairingCode).toCharArray(),
                         expectedChildId = parsed.childId,
                         expectedPairingId = parsed.pairingId,
+                        relaySessionId = parsed.relaySessionId,
                         rememberAfterAuthentication = true
                     )
                 )
                 scannedRequestId = requestId
+                val childName = parsed.name.ifBlank {
+                    getApplication<Application>().getString(org.openbabyphone.R.string.default_child_name)
+                }
                 _uiState.value = _uiState.value.copy(
-                    pairingFlow = PairingFlowState.LookingForChild(
-                        childName = parsed.name.ifBlank {
-                            getApplication<Application>().getString(org.openbabyphone.R.string.default_child_name)
-                        },
-                        childId = parsed.childId,
-                        pairingId = parsed.pairingId,
-                        requestId = requestId
+                    pairingFlow = PairingFlowState.Ready(
+                        childName = childName,
+                        request = ListenRequest(requestId, parsed.childId, parsed.pairingId)
                     )
                 )
-                matchScannedIdentity()
-                if (_uiState.value.pairingFlow is PairingFlowState.LookingForChild) {
-                    startPairingTimeout(requestId)
-                }
-                QrScanResult.Structured(
-                    parsed.name.ifBlank {
-                        getApplication<Application>().getString(org.openbabyphone.R.string.default_child_name)
-                    }
-                )
+                QrScanResult.Structured(childName)
             }
         }
     }
@@ -236,15 +228,15 @@ class DiscoverViewModel @JvmOverloads constructor(
         val row = _uiState.value.knownChildren.firstOrNull { it.child.childId == childId }
             ?: return KnownConnectionResult.NotFound
         if (row.status == KnownChildStatus.PairAgain) return KnownConnectionResult.PairAgain
-        val device = row.device ?: return KnownConnectionResult.NotFound
-        val child = trustedChildStore.findById(childId)
-            ?.takeIf { it.pairingId == device.pairingId }
-            ?: return KnownConnectionResult.PairAgain
+        val child = trustedChildStore.findById(childId) ?: return KnownConnectionResult.NotFound
+        val relaySessionId = RelaySessionId.derive(child.childId, child.pairingId)
+        val device = row.device
         val requestId = pendingConnections.put(
             PendingConnection(
-                address = device.address,
-                port = device.port,
-                name = device.visibleName.ifBlank { child.displayName },
+                address = device?.address.orEmpty(),
+                port = device?.port ?: 0,
+                relaySessionId = relaySessionId,
+                name = device?.visibleName?.ifBlank { child.displayName } ?: child.displayName,
                 pairingCode = null,
                 expectedChildId = child.childId,
                 expectedPairingId = child.pairingId
@@ -261,6 +253,9 @@ class DiscoverViewModel @JvmOverloads constructor(
                 port = device.port,
                 name = device.visibleName,
                 pairingCode = PairingCode.normalize(pairingCode).toCharArray(),
+                relaySessionId = if (device.hasIdentity) {
+                    RelaySessionId.derive(device.childId!!, device.pairingId!!)
+                } else null,
                 expectedChildId = device.childId.takeIf { device.hasIdentity },
                 expectedPairingId = device.pairingId.takeIf { device.hasIdentity },
                 rememberAfterAuthentication = device.hasIdentity
@@ -543,10 +538,10 @@ internal fun knownChildRows(
     val device = devices.firstOrNull { it.childId == child.childId }
     KnownChildRow(
         child = child,
-        status = when {
-            device == null -> KnownChildStatus.NotFound
-            device.pairingId == child.pairingId -> KnownChildStatus.Available
-            else -> KnownChildStatus.PairAgain
+        status = if (device == null || device.pairingId == child.pairingId) {
+            KnownChildStatus.Available
+        } else {
+            KnownChildStatus.PairAgain
         },
         device = device?.takeIf { it.pairingId == child.pairingId }
     )
