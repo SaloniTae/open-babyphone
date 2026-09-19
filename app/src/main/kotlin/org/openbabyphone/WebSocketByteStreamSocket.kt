@@ -181,10 +181,11 @@ class WebSocketByteStreamSocket(
         if (uri.path.isNullOrBlank()) throw IOException("Relay endpoint has no path")
 
         val plainSocket = Socket()
-        var rawSocket: SSLSocket? = null
+        var socketForFailure: SSLSocket? = null
         try {
             plainSocket.connect(InetSocketAddress(host, port), timeout.coerceAtLeast(1))
-            rawSocket = TLS_FACTORY.createSocket(plainSocket, host, port, true) as SSLSocket
+            val rawSocket = TLS_FACTORY.createSocket(plainSocket, host, port, true) as SSLSocket
+            socketForFailure = rawSocket
             rawSocket.useClientMode = true
             rawSocket.sslParameters = rawSocket.sslParameters.apply {
                 endpointIdentificationAlgorithm = "HTTPS"
@@ -243,14 +244,16 @@ class WebSocketByteStreamSocket(
             opened.countDown()
         } catch (e: Exception) {
             try {
-                rawSocket?.close()
+                socketForFailure?.close()
             } catch (_: IOException) {
                 // Ignore cleanup failure.
             }
-            try {
-                if (rawSocket == null) plainSocket.close()
-            } catch (_: IOException) {
-                // Ignore cleanup failure.
+            if (socketForFailure == null) {
+                try {
+                    plainSocket.close()
+                } catch (_: IOException) {
+                    // Ignore cleanup failure.
+                }
             }
             synchronized(lock) {
                 failure = if (e is IOException) e else IOException("Relay WebSocket connect failed", e)
