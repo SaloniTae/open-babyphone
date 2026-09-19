@@ -205,9 +205,47 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8338);
 const sessions = new Map();
+const MAX_PENDING_BYTES = 512 * 1024;
 
 const validSessionId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9_-]{20,128}$/.test(value);
+
+function createSession() {
+  return {
+    child: null,
+    parent: null,
+    pendingForChild: [],
+    pendingForParent: [],
+    pendingBytes: 0
+  };
+}
+
+function pendingQueueFor(session, role) {
+  return role === "child" ? session.pendingForChild : session.pendingForParent;
+}
+
+function queueForPeer(session, peerRole, data) {
+  const queue = pendingQueueFor(session, peerRole);
+  const copy = Buffer.from(data);
+  if (session.pendingBytes + copy.length > MAX_PENDING_BYTES) {
+    queue.length = 0;
+    session.pendingBytes = 0;
+    return;
+  }
+  queue.push(copy);
+  session.pendingBytes += copy.length;
+}
+
+function flushPending(session, role, ws) {
+  const queue = pendingQueueFor(session, role);
+  if (ws.readyState !== 1 || queue.length === 0) return;
+  for (const data of queue) {
+    if (ws.readyState !== 1) break;
+    ws.send(data, { binary: true });
+  }
+  session.pendingBytes -= queue.reduce((sum, data) => sum + data.length, 0);
+  queue.length = 0;
+}
 
 function cleanup(sessionId, ws) {
   const session = sessions.get(sessionId);
@@ -249,11 +287,17 @@ wss.on("connection", (ws, _req, sessionId, role) => {
   }
 
   session[role] = ws;
+  flushPending(session, role, ws);
 
   ws.on("message", (data, isBinary) => {
     if (!isBinary) return;
-    const peer = role === "child" ? session.parent : session.child;
-    if (peer?.readyState === 1) peer.send(data, { binary: true });
+    const peerRole = role === "child" ? "parent" : "child";
+    const peer = session[peerRole];
+    if (peer?.readyState === 1) {
+      peer.send(data, { binary: true });
+    } else {
+      queueForPeer(session, peerRole, data);
+    }
   });
 
   ws.on("close", () => cleanup(sessionId, ws));
