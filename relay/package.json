@@ -1,0 +1,16 @@
+{
+  "name": "open-babyphone-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Internet relay for Open Babyphone",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
