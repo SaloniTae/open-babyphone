@@ -239,13 +239,18 @@ RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=$APP_DIR
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Disable only the temporary ACME site; the final relay site serves ACME too.
+if [ -L /etc/nginx/sites-enabled/babyphone-acme ] && [ "$(readlink -f /etc/nginx/sites-enabled/babyphone-acme)" = "$ACME_SITE" ]; then
+  rm -f /etc/nginx/sites-enabled/babyphone-acme
+fi
 
 echo "[9/10] Installing isolated nginx site..."
 if [ -e "$NGINX_SITE" ]; then
