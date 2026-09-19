@@ -432,7 +432,7 @@ class ListenService : Service() {
         }
         val pending = requestId.takeIf { it.isNotBlank() }?.let(PendingConnections.store::lease)
         if (pending != null) {
-            if (pending.address.isBlank() || pending.port !in VALID_PORT_RANGE) return ConnectionResolution.Missing
+            if (pending.relaySessionId == null && (pending.address.isBlank() || pending.port !in VALID_PORT_RANGE)) return ConnectionResolution.Missing
             val pendingIdentity = pending.expectedChildId?.let { childId ->
                 ExpectedChildIdentity(childId, checkNotNull(pending.expectedPairingId))
             }
@@ -450,6 +450,7 @@ class ListenService : Service() {
                     requestId = requestId,
                     address = pending.address,
                     port = pending.port,
+                    relaySessionId = pending.relaySessionId,
                     name = pending.name,
                     pairingCode = pairingCode,
                     expectedIdentity = identity,
@@ -462,17 +463,13 @@ class ListenService : Service() {
             TrustedConnectionResult.Missing -> ConnectionResolution.Missing
             TrustedConnectionResult.Unavailable -> ConnectionResolution.CredentialUnavailable
             is TrustedConnectionResult.Available -> {
-                val address = trusted.child.lastKnownAddress
-                val port = trusted.child.lastKnownPort
-                if (address == null || port == null) {
-                    trusted.pairingCode.fill('\u0000')
-                    return ConnectionResolution.Missing
-                }
+                val relaySessionId = RelaySessionId.derive(identity.childId, identity.pairingId)
                 ConnectionResolution.Available(
                     ListenConnection(
                         requestId = null,
-                        address = address,
-                        port = port,
+                        address = trusted.child.lastKnownAddress.orEmpty(),
+                        port = trusted.child.lastKnownPort ?: 0,
+                        relaySessionId = relaySessionId,
                         name = trusted.child.displayName,
                         pairingCode = trusted.pairingCode,
                         expectedIdentity = identity,
@@ -490,7 +487,7 @@ class ListenService : Service() {
         synchronized(sessionStateLock) {
             deliveryHealth.disarm()
         }
-        if (port !in VALID_PORT_RANGE) {
+        if (connection.relaySessionId == null && port !in VALID_PORT_RANGE) {
             connection.pairingCode.fill('\u0000')
             Log.e(TAG, "Invalid socket port")
             handleTerminalFailure(ListenSessionError.Unreachable, claim)
@@ -505,7 +502,9 @@ class ListenService : Service() {
             do {
                 if (!isWorkerActive(claim)) break
                 try {
-                    val socket = Socket()
+                    val socket = connection.relaySessionId?.let {
+                        WebSocketByteStreamSocket(it, WebSocketByteStreamSocket.Role.PARENT)
+                    } ?: Socket()
                     val canConnect = synchronized(sessionStateLock) {
                         if (!isWorkerActive(claim)) {
                             false
@@ -518,7 +517,11 @@ class ListenService : Service() {
                         socket.close()
                         break
                     }
-                    socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+                    if (connection.relaySessionId != null) {
+                        socket.connect(null, RelayConfig.CONNECT_TIMEOUT_MS)
+                    } else {
+                        socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+                    }
                     socket.soTimeout = SOCKET_READ_TIMEOUT_MS
 
                     val sessionInfo = performHandshake(socket, connection.pairingCode, connection.expectedIdentity)
@@ -538,10 +541,22 @@ class ListenService : Service() {
                         }
                         val verifiedAudioThisConnection = AtomicBoolean(false)
                         val streamResult = try {
-                            val connectedAddress = address
                             val trustedChildStore = trustedChildStore()
-                            val storageResult = if (!trustPersisted) {
-                                trustedChildStore.trustAuthenticated(
+                            val storageResult = if (connection.relaySessionId != null) {
+                                if (!trustPersisted) {
+                                    trustedChildStore.trustAuthenticatedRelay(
+                                        childId = sessionInfo.childId,
+                                        pairingId = sessionInfo.pairingId,
+                                        displayName = connection.name,
+                                        pairingCode = connection.pairingCode
+                                    )
+                                } else {
+                                    CredentialStorageResult.Success
+                                }
+                            } else {
+                                val connectedAddress = address
+                                if (!trustPersisted) {
+                                    trustedChildStore.trustAuthenticated(
                                         childId = sessionInfo.childId,
                                         pairingId = sessionInfo.pairingId,
                                         displayName = connection.name,
@@ -549,14 +564,15 @@ class ListenService : Service() {
                                         address = connectedAddress,
                                         port = port
                                     )
-                            } else {
-                                trustedChildStore.updateLastKnownAuthenticated(
+                                } else {
+                                    trustedChildStore.updateLastKnownAuthenticated(
                                         sessionInfo.childId,
                                         sessionInfo.pairingId,
                                         connectedAddress,
                                         port
                                     )
-                                CredentialStorageResult.Success
+                                    CredentialStorageResult.Success
+                                }
                             }
                             if (storageResult != CredentialStorageResult.Success) {
                                 socket.close()
@@ -1302,6 +1318,7 @@ class ListenService : Service() {
         val port: Int,
         val name: String,
         val pairingCode: CharArray,
+        val relaySessionId: String?,
         val expectedIdentity: ExpectedChildIdentity?,
         val rememberAfterAuthentication: Boolean
     )
