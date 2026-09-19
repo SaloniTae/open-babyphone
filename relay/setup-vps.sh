@@ -34,8 +34,10 @@ NVM_DIR="/root/.nvm"
 source "$NVM_DIR/nvm.sh"
 NODE20_BIN="$(nvm which 20 2>/dev/null || true)"
 [ -x "$NODE20_BIN" ] || die "Node.js 20 is not installed in nvm. Nothing downloaded."
-NODE20_DIR="$(dirname "$NODE20_BIN")"
+NODE20_HOME="$(cd "$(dirname "$NODE20_BIN")/.." && pwd)"
+NODE20_DIR="$NODE20_HOME/bin"
 echo "Using $NODE20_BIN"
+echo "Node home: $NODE20_HOME"
 "$NODE20_BIN" --version
 
 echo "[3/10] Verifying DNS..."
@@ -199,8 +201,8 @@ chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 echo "[8/10] Installing only missing npm dependency..."
 NPM_CLI_JS=""
 for candidate in \
-  "$NODE20_DIR/lib/node_modules/npm/bin/npm-cli.js" \
-  "$NODE20_DIR/node_modules/npm/bin/npm-cli.js"; do
+  "$NODE20_HOME/lib/node_modules/npm/bin/npm-cli.js" \
+  "$NODE20_HOME/node_modules/npm/bin/npm-cli.js"; do
   if [ -r "$candidate" ]; then
     NPM_CLI_JS="$candidate"
     break
