@@ -36,9 +36,23 @@ NODE20_BIN="$(nvm which 20 2>/dev/null || true)"
 [ -x "$NODE20_BIN" ] || die "Node.js 20 is not installed in nvm. Nothing downloaded."
 NODE20_HOME="$(cd "$(dirname "$NODE20_BIN")/.." && pwd)"
 NODE20_DIR="$NODE20_HOME/bin"
+NODE20_VERSION="$("$NODE20_BIN" --version)"
+NODE20_RUNTIME="/usr/local/bin/open-babyphone-node20"
 echo "Using $NODE20_BIN"
 echo "Node home: $NODE20_HOME"
-"$NODE20_BIN" --version
+echo "$NODE20_VERSION"
+
+# systemd cannot execute a Node binary living under /root when the service runs
+# as an unprivileged user. Reuse the existing Node 20 binary by staging a copy
+# in /usr/local/bin; this does not download or install another Node.js version.
+RUNTIME_VERSION=""
+if [ -x "$NODE20_RUNTIME" ]; then
+  RUNTIME_VERSION="$("$NODE20_RUNTIME" --version 2>/dev/null || true)"
+fi
+if [ "$RUNTIME_VERSION" != "$NODE20_VERSION" ]; then
+  install -m 0755 "$NODE20_BIN" "$NODE20_RUNTIME"
+fi
+"$NODE20_RUNTIME" --version
 
 echo "[3/10] Verifying DNS..."
 RESOLVED_IP="$(getent hosts "$DOMAIN" | awk 'NR==1{print $1}')"
@@ -48,11 +62,26 @@ echo "$DOMAIN -> $RESOLVED_IP"
 echo "[4/10] Preparing ACME webroot..."
 mkdir -p "$ACME_WEBROOT"
 
+CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+HAVE_CERT=false
+if [ -f "$CERT" ] && [ -f "$KEY" ]; then
+  HAVE_CERT=true
+fi
+
 echo "[5/10] Preparing nginx ACME endpoint..."
-if [ -e "$ACME_SITE" ]; then
-  grep -q "server_name $DOMAIN;" "$ACME_SITE" || die "$ACME_SITE exists and is not recognized. Nothing changed."
+if $HAVE_CERT; then
+  # A previous run may have left the temporary ACME site enabled. Remove only
+  # our own temporary symlink so it cannot conflict with the final relay site.
+  if [ -L /etc/nginx/sites-enabled/babyphone-acme ] && [ "$(readlink -f /etc/nginx/sites-enabled/babyphone-acme)" = "$ACME_SITE" ]; then
+    rm -f /etc/nginx/sites-enabled/babyphone-acme
+  fi
+  echo "Existing Babyphone certificate found; temporary ACME site not enabled."
 else
-  cat > "$ACME_SITE" <<EOF
+  if [ -e "$ACME_SITE" ]; then
+    grep -q "server_name $DOMAIN;" "$ACME_SITE" || die "$ACME_SITE exists and is not recognized. Nothing changed."
+  else
+    cat > "$ACME_SITE" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -69,19 +98,22 @@ server {
     }
 }
 EOF
+  fi
+  ln -sf "$ACME_SITE" /etc/nginx/sites-enabled/babyphone-acme
+  nginx -t
+  systemctl reload nginx
 fi
-ln -sf "$ACME_SITE" /etc/nginx/sites-enabled/babyphone-acme
-nginx -t
-systemctl reload nginx
 
 echo "[6/10] Obtaining/checking TLS certificate..."
-CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-if [ -f "$CERT" ] && [ -f "$KEY" ]; then
+if $HAVE_CERT; then
   echo "Existing Babyphone certificate found; no certificate download."
 else
   certbot certonly --webroot -w "$ACME_WEBROOT" --non-interactive --agree-tos --keep-until-expiring -d "$DOMAIN"
   [ -f "$CERT" ] && [ -f "$KEY" ] || die "Certbot did not create the expected certificate."
+  HAVE_CERT=true
+  if [ -L /etc/nginx/sites-enabled/babyphone-acme ] && [ "$(readlink -f /etc/nginx/sites-enabled/babyphone-acme)" = "$ACME_SITE" ]; then
+    rm -f /etc/nginx/sites-enabled/babyphone-acme
+  fi
 fi
 
 echo "[7/10] Installing relay application..."
@@ -233,7 +265,7 @@ WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
 Environment=PORT=$PORT
 Environment=PATH=$NODE20_DIR:/usr/local/bin:/usr/bin:/bin
-ExecStart=$NODE20_BIN $APP_DIR/server.js
+ExecStart=$NODE20_RUNTIME $APP_DIR/server.js
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
