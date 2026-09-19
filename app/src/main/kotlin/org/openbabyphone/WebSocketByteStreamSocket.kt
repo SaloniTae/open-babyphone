@@ -19,6 +19,7 @@ import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
@@ -179,10 +180,16 @@ class WebSocketByteStreamSocket(
         val port = if (uri.port > 0) uri.port else 443
         if (uri.path.isNullOrBlank()) throw IOException("Relay endpoint has no path")
 
-        val rawSocket = TLS_FACTORY.createSocket() as SSLSocket
+        val plainSocket = Socket()
+        var rawSocket: SSLSocket? = null
         try {
-            rawSocket.connect(InetSocketAddress(host, port), timeout.coerceAtLeast(1))
+            plainSocket.connect(InetSocketAddress(host, port), timeout.coerceAtLeast(1))
+            rawSocket = TLS_FACTORY.createSocket(plainSocket, host, port, true) as SSLSocket
             rawSocket.useClientMode = true
+            rawSocket.sslParameters = rawSocket.sslParameters.apply {
+                endpointIdentificationAlgorithm = "HTTPS"
+                serverNames = listOf(SNIHostName(host))
+            }
             rawSocket.startHandshake()
 
             val requestKeyBytes = ByteArray(16).also(RANDOM::nextBytes)
@@ -236,7 +243,12 @@ class WebSocketByteStreamSocket(
             opened.countDown()
         } catch (e: Exception) {
             try {
-                rawSocket.close()
+                rawSocket?.close()
+            } catch (_: IOException) {
+                // Ignore cleanup failure.
+            }
+            try {
+                if (rawSocket == null) plainSocket.close()
             } catch (_: IOException) {
                 // Ignore cleanup failure.
             }
