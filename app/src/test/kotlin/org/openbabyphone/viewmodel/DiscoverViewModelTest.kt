@@ -22,6 +22,7 @@ import org.openbabyphone.CredentialStorageResult
 import org.openbabyphone.PairingQrCode
 import org.openbabyphone.PendingConnectionStore
 import org.openbabyphone.ProtectedTrustedCredentialStore
+import org.openbabyphone.RelaySessionId
 import org.openbabyphone.TrustedChildStore
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
