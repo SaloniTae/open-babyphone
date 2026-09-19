@@ -73,8 +73,8 @@ object PairingQrCode {
         childId: String,
         pairingId: String,
         name: String,
-        relaySessionId: String = RelaySessionId.derive(childId, pairingId),
-        pairingCode: String
+        pairingCode: String,
+        relaySessionId: String = RelaySessionId.derive(childId, pairingId)
     ): String {
         require(PairingCode.isValid(pairingCode)) { "Pairing code is invalid" }
         val params = mutableListOf(
