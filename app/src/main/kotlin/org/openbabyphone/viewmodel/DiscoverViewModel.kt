@@ -292,6 +292,20 @@ class DiscoverViewModel @JvmOverloads constructor(
             discoveredDevices.add(device)
         }
         publishDevices()
+        val flow = _uiState.value.pairingFlow
+        if (flow is PairingFlowState.Ready &&
+            flow.request.childId == device.childId &&
+            flow.request.pairingId == device.pairingId
+        ) {
+            pendingConnections.complete(
+                requestId = flow.request.requestId,
+                address = device.address,
+                port = device.port,
+                name = device.visibleName,
+                childId = device.childId,
+                pairingId = device.pairingId
+            )
+        }
         matchScannedIdentity()
     }
 
