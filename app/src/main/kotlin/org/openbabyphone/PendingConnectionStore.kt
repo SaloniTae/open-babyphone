@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.asStateFlow
 data class PendingConnection(
     val address: String = "",
     val port: Int = 0,
+    val relaySessionId: String? = null,
     val name: String,
     val pairingCode: CharArray?,
     val expectedChildId: String? = null,
@@ -37,6 +38,8 @@ data class PendingConnection(
     init {
         require((address.isBlank()) == (port == 0))
         require(port == 0 || port in 1..65535)
+        require(relaySessionId == null || relaySessionId.matches(Regex("[A-Fa-f0-9]{64}")))
+        require(port != 0 || relaySessionId != null)
         require(pairingCode == null || PairingCode.isValid(pairingCode.concatToString()))
         require((expectedChildId == null) == (expectedPairingId == null))
         require(!rememberAfterAuthentication || expectedChildId != null)
