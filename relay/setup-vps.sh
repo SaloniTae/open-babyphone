@@ -24,35 +24,90 @@ PORT8338="$(ss -ltnp 2>/dev/null | grep -E ':(8338)\b' || true)"
 [ -z "$PORT8338" ] || die "Port 8338 is already in use. Nothing changed."
 [ -z "$PORT80" ] || echo "$PORT80" | grep -q nginx || die "Port 80 is occupied by a non-nginx process. Nothing changed."
 [ -z "$PORT443" ] || echo "$PORT443" | grep -q nginx || die "Port 443 is occupied by a non-nginx process. Nothing changed."
-have_cmd nginx || die "nginx is not installed. Nothing downloaded."
-have_cmd certbot || die "certbot is not installed. Nothing downloaded."
+if ! have_cmd nginx || ! have_cmd certbot; then
+  have_cmd apt-get || die "apt-get is required to install missing nginx/certbot."
+  echo "Missing nginx/certbot detected; installing only the missing VPS packages..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  have_cmd nginx || apt-get install -y nginx
+  have_cmd certbot || apt-get install -y certbot
+fi
+have_cmd nginx || die "nginx installation failed."
+have_cmd certbot || die "certbot installation failed."
 
-echo "[2/10] Selecting existing Node.js 20 from nvm..."
-NVM_DIR="/root/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] || die "nvm is not installed. Nothing downloaded."
-# shellcheck disable=SC1091
-source "$NVM_DIR/nvm.sh"
-NODE20_BIN="$(nvm which 20 2>/dev/null || true)"
-[ -x "$NODE20_BIN" ] || die "Node.js 20 is not installed in nvm. Nothing downloaded."
-NODE20_HOME="$(cd "$(dirname "$NODE20_BIN")/.." && pwd)"
-NODE20_DIR="$NODE20_HOME/bin"
-NODE20_VERSION="$("$NODE20_BIN" --version)"
+echo "[2/10] Selecting Node.js 20 for Babyphone only..."
+NODE20_VERSION="20.20.2"
+PROJECT_NODE_HOME="$APP_DIR/node-v$NODE20_VERSION"
+PROJECT_NODE_BIN="$PROJECT_NODE_HOME/bin/node"
 NODE20_RUNTIME="/usr/local/bin/open-babyphone-node20"
+
+# Prefer the already-staged project runtime, then an existing nvm Node 20.
+if [ -x "$NODE20_RUNTIME" ] && [ "$("$NODE20_RUNTIME" --version 2>/dev/null || true)" = "v$NODE20_VERSION" ]; then
+  NODE20_BIN="$NODE20_RUNTIME"
+  NODE20_HOME="$PROJECT_NODE_HOME"
+  NODE20_DIR="$(dirname "$NODE20_RUNTIME")"
+  echo "Using existing Babyphone-only Node.js runtime: $NODE20_RUNTIME"
+elif [ -s "/root/.nvm/nvm.sh" ]; then
+  # shellcheck disable=SC1091
+  source "/root/.nvm/nvm.sh"
+  NVM_NODE20_BIN="$(nvm which 20 2>/dev/null || true)"
+  if [ -x "$NVM_NODE20_BIN" ] && [ "$("$NVM_NODE20_BIN" --version)" = "v$NODE20_VERSION" ]; then
+    NODE20_BIN="$NVM_NODE20_BIN"
+    NODE20_HOME="$(cd "$(dirname "$NODE20_BIN")/.." && pwd)"
+    NODE20_DIR="$NODE20_HOME/bin"
+    echo "Reusing existing nvm Node.js 20: $NODE20_BIN"
+  fi
+fi
+
+# If neither exists, install Node 20.20.2 inside the Babyphone project only.
+if [ -z "${NODE20_BIN:-}" ] || [ ! -x "$NODE20_BIN" ]; then
+  have_cmd curl || die "curl is required to download project-local Node.js."
+  have_cmd sha256sum || die "sha256sum is required to verify project-local Node.js."
+  have_cmd tar || die "tar is required to unpack project-local Node.js."
+  ARCH="$(uname -m)"
+  case "$ARCH" in
+    x86_64) NODE_ARCH="x64"; NODE_SHA="19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b" ;;
+    aarch64|arm64) NODE_ARCH="arm64"; NODE_SHA="47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d" ;;
+    *) die "Unsupported VPS architecture for project-local Node.js 20: $ARCH" ;;
+  esac
+  mkdir -p "$APP_DIR"
+  NODE_TARBALL="/tmp/node-v$NODE20_VERSION-linux-$NODE_ARCH.tar.gz"
+  NODE_URL="https://nodejs.org/dist/v$NODE20_VERSION/node-v$NODE20_VERSION-linux-$NODE_ARCH.tar.gz"
+  if [ ! -x "$PROJECT_NODE_BIN" ]; then
+    echo "Node.js 20.20.2 is not present; downloading it only for Babyphone..."
+    curl -fL "$NODE_URL" -o "$NODE_TARBALL"
+    printf '%s  %s\n' "$NODE_SHA" "$NODE_TARBALL" | sha256sum -c -
+    rm -rf "$PROJECT_NODE_HOME"
+    mkdir -p "$APP_DIR"
+    tar -xzf "$NODE_TARBALL" -C "$APP_DIR"
+    mv "$APP_DIR/node-v$NODE20_VERSION-linux-$NODE_ARCH" "$PROJECT_NODE_HOME"
+    rm -f "$NODE_TARBALL"
+  fi
+  NODE20_BIN="$PROJECT_NODE_BIN"
+  NODE20_HOME="$PROJECT_NODE_HOME"
+  NODE20_DIR="$NODE20_HOME/bin"
+  echo "Installed project-local Node.js: $NODE20_BIN"
+fi
+
+[ -x "$NODE20_BIN" ] || die "Node.js 20 runtime is unavailable."
 echo "Using $NODE20_BIN"
 echo "Node home: $NODE20_HOME"
-echo "$NODE20_VERSION"
+"$NODE20_BIN" --version
 
-# systemd cannot execute a Node binary living under /root when the service runs
-# as an unprivileged user. Reuse the existing Node 20 binary by staging a copy
-# in /usr/local/bin; this does not download or install another Node.js version.
-RUNTIME_VERSION=""
-if [ -x "$NODE20_RUNTIME" ]; then
-  RUNTIME_VERSION="$("$NODE20_RUNTIME" --version 2>/dev/null || true)"
-fi
-if [ "$RUNTIME_VERSION" != "$NODE20_VERSION" ]; then
-  install -m 0755 "$NODE20_BIN" "$NODE20_RUNTIME"
+# Stage the exact project-selected Node 20 binary outside /root so systemd can
+# execute it as the unprivileged relay user. This does not alter system/default Node.
+if [ "$NODE20_BIN" != "$NODE20_RUNTIME" ]; then
+  RUNTIME_VERSION=""
+  if [ -x "$NODE20_RUNTIME" ]; then
+    RUNTIME_VERSION="$("$NODE20_RUNTIME" --version 2>/dev/null || true)"
+  fi
+  if [ "$RUNTIME_VERSION" != "v$NODE20_VERSION" ]; then
+    install -m 0755 "$NODE20_BIN" "$NODE20_RUNTIME"
+  fi
 fi
 "$NODE20_RUNTIME" --version
+NODE20_BIN="$NODE20_RUNTIME"
+NODE20_DIR="/usr/local/bin"
 
 echo "[3/10] Verifying DNS..."
 RESOLVED_IP="$(getent hosts "$DOMAIN" | awk 'NR==1{print $1}')"
@@ -355,6 +410,29 @@ curl -fsS "http://127.0.0.1:$PORT/healthz"
 echo
 curl -fsS "https://$DOMAIN/healthz"
 echo
+echo "Testing public WSS upgrade..."
+"$NODE20_BIN" --input-type=module - <<'NODE'
+import WebSocket from "/opt/open-babyphone-relay/node_modules/ws/index.js";
+const session = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const url = "wss://babyphone.duckdns.org/relay?session=" + session + "&role=child";
+await new Promise((resolve, reject) => {
+  const ws = new WebSocket(url);
+  const timer = setTimeout(() => {
+    ws.terminate();
+    reject(new Error("WSS upgrade timed out"));
+  }, 10000);
+  ws.once("open", () => {
+    clearTimeout(timer);
+    ws.close(1000, "setup verification");
+  });
+  ws.once("close", () => resolve());
+  ws.once("error", (error) => {
+    clearTimeout(timer);
+    reject(error);
+  });
+});
+NODE
+echo "WSS upgrade OK"
 "$NODE20_BIN" --version
 echo
 echo "READY"
