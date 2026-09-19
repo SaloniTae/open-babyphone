@@ -247,12 +247,26 @@ function flushPending(session, role, ws) {
   queue.length = 0;
 }
 
-function cleanup(sessionId, ws) {
+function cleanup(sessionId, ws, reason = "peer disconnected") {
   const session = sessions.get(sessionId);
   if (!session) return;
-  if (session.child === ws) session.child = null;
-  if (session.parent === ws) session.parent = null;
-  if (!session.child && !session.parent) sessions.delete(sessionId);
+
+  if (session.child !== ws && session.parent !== ws) return;
+
+  const peer = session.child === ws ? session.parent : session.child;
+  sessions.delete(sessionId);
+  session.pendingForChild.length = 0;
+  session.pendingForParent.length = 0;
+  session.pendingBytes = 0;
+
+  if (peer && peer.readyState === 1) {
+    console.log(`Closing relay peer for session ${sessionId.slice(0, 12)}…: ${reason}`);
+    try {
+      peer.terminate();
+    } catch {
+      // Ignore peer-close races.
+    }
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -282,11 +296,13 @@ wss.on("connection", (ws, _req, sessionId, role) => {
   }
 
   if (session[role]) {
+    console.warn(`Rejecting duplicate relay ${role} connection for session ${sessionId.slice(0, 12)}…`);
     ws.close(1008, "role already connected");
     return;
   }
 
   session[role] = ws;
+  console.log(`Relay ${role} connected for session ${sessionId.slice(0, 12)}…`);
   flushPending(session, role, ws);
 
   ws.on("message", (data, isBinary) => {
@@ -300,8 +316,11 @@ wss.on("connection", (ws, _req, sessionId, role) => {
     }
   });
 
-  ws.on("close", () => cleanup(sessionId, ws));
-  ws.on("error", () => cleanup(sessionId, ws));
+  ws.on("close", () => cleanup(sessionId, ws, `${role} closed`));
+  ws.on("error", (error) => {
+    console.warn(`Relay ${role} socket error for session ${sessionId.slice(0, 12)}…:`, error.message);
+    cleanup(sessionId, ws, `${role} error`);
+  });
 });
 
 server.on("upgrade", (req, socket, head) => {
