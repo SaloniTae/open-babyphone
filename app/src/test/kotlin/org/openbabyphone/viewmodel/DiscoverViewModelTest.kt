@@ -135,7 +135,7 @@ class DiscoverViewModelTest {
     @Test
     fun `new scan cancels previous pending request`() {
         viewModel.handleQrScan(payload())
-        val oldRequest = (viewModel.uiState.value.pairingFlow as PairingFlowState.LookingForChild).requestId
+        val oldRequest = (viewModel.uiState.value.pairingFlow as PairingFlowState.Ready).request.requestId
 
         viewModel.handleQrScan(
             PairingQrCode.buildPayload("child-2", "pair-2", "Bedroom", "code5678")
