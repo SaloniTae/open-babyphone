@@ -432,7 +432,8 @@ class ListenService : Service() {
         }
         val pending = requestId.takeIf { it.isNotBlank() }?.let(PendingConnections.store::lease)
         if (pending != null) {
-            if (pending.relaySessionId == null && (pending.address.isBlank() || pending.port !in VALID_PORT_RANGE)) return ConnectionResolution.Missing
+            val hasDirectEndpoint = pending.address.isNotBlank() && pending.port in VALID_PORT_RANGE
+            if (!hasDirectEndpoint && pending.relaySessionId == null) return ConnectionResolution.Missing
             val pendingIdentity = pending.expectedChildId?.let { childId ->
                 ExpectedChildIdentity(childId, checkNotNull(pending.expectedPairingId))
             }
@@ -450,7 +451,7 @@ class ListenService : Service() {
                     requestId = requestId,
                     address = pending.address,
                     port = pending.port,
-                    relaySessionId = pending.relaySessionId,
+                    relaySessionId = if (hasDirectEndpoint) null else pending.relaySessionId,
                     name = pending.name,
                     pairingCode = pairingCode,
                     expectedIdentity = identity,
@@ -463,12 +464,19 @@ class ListenService : Service() {
             TrustedConnectionResult.Missing -> ConnectionResolution.Missing
             TrustedConnectionResult.Unavailable -> ConnectionResolution.CredentialUnavailable
             is TrustedConnectionResult.Available -> {
-                val relaySessionId = RelaySessionId.derive(identity.childId, identity.pairingId)
+                val address = trusted.child.lastKnownAddress.orEmpty()
+                val port = trusted.child.lastKnownPort ?: 0
+                val hasDirectEndpoint = address.isNotBlank() && port in VALID_PORT_RANGE
+                val relaySessionId = if (hasDirectEndpoint) {
+                    null
+                } else {
+                    RelaySessionId.derive(identity.childId, identity.pairingId)
+                }
                 ConnectionResolution.Available(
                     ListenConnection(
                         requestId = null,
-                        address = trusted.child.lastKnownAddress.orEmpty(),
-                        port = trusted.child.lastKnownPort ?: 0,
+                        address = address,
+                        port = port,
                         relaySessionId = relaySessionId,
                         name = trusted.child.displayName,
                         pairingCode = trusted.pairingCode,
@@ -887,7 +895,10 @@ class ListenService : Service() {
         var baseKey: ByteArray? = null
         var authKey: ByteArray? = null
         return try {
-            val deadline = HandshakeDeadline(AUTH_TIMEOUT_MS, SystemClock::elapsedRealtime)
+            val deadline = HandshakeDeadline(
+                if (socket is WebSocketByteStreamSocket) RELAY_PARENT_AUTH_TIMEOUT_MS else AUTH_TIMEOUT_MS,
+                SystemClock::elapsedRealtime
+            )
             val input = deadline.input(socket.getInputStream()) { socket.soTimeout = it }
             val hello = Handshake.readChildHello(input)
                 ?: run {
@@ -1304,6 +1315,7 @@ class ListenService : Service() {
         private const val MAX_RECONNECT_ATTEMPTS = 5
         private const val SOCKET_READ_TIMEOUT_MS = 1000
         private const val AUTH_TIMEOUT_MS = 10_000L
+        private const val RELAY_PARENT_AUTH_TIMEOUT_MS = 60_000L
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val DELIVERY_HEALTH_POLL_MS = 250L
         private const val AUDIO_WRITE_RETRY_MS = 5L
