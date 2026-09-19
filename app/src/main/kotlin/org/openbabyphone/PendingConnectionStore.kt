@@ -5,14 +5,6 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- *
- * Open Babyphone is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Open Babyphone. If not, see <http://www.gnu.org/licenses/>.
  */
 package org.openbabyphone
 
@@ -32,7 +24,9 @@ data class PendingConnection(
     val pairingCode: CharArray?,
     val expectedChildId: String? = null,
     val expectedPairingId: String? = null,
-    val rememberAfterAuthentication: Boolean = false
+    val rememberAfterAuthentication: Boolean = false,
+    val internetRelay: Boolean = false,
+    val relaySessionId: String? = null
 ) {
     init {
         require((address.isBlank()) == (port == 0))
@@ -40,6 +34,7 @@ data class PendingConnection(
         require(pairingCode == null || PairingCode.isValid(pairingCode.concatToString()))
         require((expectedChildId == null) == (expectedPairingId == null))
         require(!rememberAfterAuthentication || expectedChildId != null)
+        require(!internetRelay || !relaySessionId.isNullOrBlank())
     }
 
     internal fun wipeCredential() {
@@ -82,7 +77,6 @@ class PendingConnectionStore internal constructor(
         return requestId
     }
 
-    /** Leases a request without consuming it so connection retries can reuse it. */
     @Synchronized
     fun lease(requestId: String): PendingConnection? {
         removeExpired()
@@ -114,7 +108,6 @@ class PendingConnectionStore internal constructor(
         return requestId
     }
 
-    /** Adds an endpoint while retaining the credential and expected identity in this store. */
     @Synchronized
     fun completeEndpoint(requestId: String, address: String, port: Int, name: String): String? {
         removeExpired()
