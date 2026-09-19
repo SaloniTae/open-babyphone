@@ -19,7 +19,7 @@ object RelayConfig {
             .getString(KEY_TOKEN, DEFAULT_TOKEN) ?: DEFAULT_TOKEN
 
     fun configure(context: Context, url: String, token: String) {
-        require(url.startsWith("wss://"))
+        require(url.startsWith("ws://") || url.startsWith("wss://"))
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_URL, url.removeSuffix("/"))
