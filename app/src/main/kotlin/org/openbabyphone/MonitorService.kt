@@ -565,6 +565,8 @@ class MonitorService : Service() {
                 return@Thread
             }
 
+            startRelayLoop(sessionId, claim)
+
             while (isWorkerActive(claim) && this.connectionToken == currentToken) {
                 val portToBind = currentPort
                 val serverSocket = try {
