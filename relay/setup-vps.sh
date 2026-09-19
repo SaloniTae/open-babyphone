@@ -21,7 +21,15 @@ echo "[1/10] Verifying existing services..."
 PORT80="$(ss -ltnp 2>/dev/null | grep -E ':(80)\b' || true)"
 PORT443="$(ss -ltnp 2>/dev/null | grep -E ':(443)\b' || true)"
 PORT8338="$(ss -ltnp 2>/dev/null | grep -E ':(8338)\b' || true)"
-[ -z "$PORT8338" ] || die "Port 8338 is already in use. Nothing changed."
+if [ -n "$PORT8338" ]; then
+  if systemctl is-active --quiet open-babyphone-relay.service; then
+    echo "Existing Babyphone relay owns port 8338; stopping only that service for an idempotent update."
+    systemctl stop open-babyphone-relay.service
+    PORT8338=""
+  else
+    die "Port 8338 is already in use by another process. Nothing changed."
+  fi
+fi
 [ -z "$PORT80" ] || echo "$PORT80" | grep -q nginx || die "Port 80 is occupied by a non-nginx process. Nothing changed."
 [ -z "$PORT443" ] || echo "$PORT443" | grep -q nginx || die "Port 443 is occupied by a non-nginx process. Nothing changed."
 if ! have_cmd nginx || ! have_cmd certbot; then
