@@ -256,7 +256,8 @@ class WebSocketByteStreamSocket(
         val path = uri.rawPath.takeIf { it.isNotEmpty() } ?: "/"
         val query = uri.rawQuery?.takeIf { it.isNotEmpty() }
         val base = if (query == null) path else "$path?$query"
-        return "$base&session=$sessionId&role=${role.name.lowercase()}"
+        val separator = if (query == null) "?" else "&"
+        return "$base${separator}session=$sessionId&role=${role.name.lowercase()}"
     }
 
     override fun getInputStream(): InputStream = input
@@ -401,7 +402,6 @@ class WebSocketByteStreamSocket(
             if (isClosed.get()) return
             if (queuedBytes + data.size > MAX_MESSAGE_BYTES) {
                 failure = IOException("Relay receive buffer overflow")
-                isClosed.set(true)
                 lock.notifyAll()
                 throw failure!!
             }
