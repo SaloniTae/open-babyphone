@@ -21,11 +21,9 @@ echo "[1/10] Verifying existing services..."
 PORT80="$(ss -ltnp 2>/dev/null | grep -E ':(80)\b' || true)"
 PORT443="$(ss -ltnp 2>/dev/null | grep -E ':(443)\b' || true)"
 PORT8338="$(ss -ltnp 2>/dev/null | grep -E ':(8338)\b' || true)"
-
 [ -z "$PORT8338" ] || die "Port 8338 is already in use. Nothing changed."
 [ -z "$PORT80" ] || echo "$PORT80" | grep -q nginx || die "Port 80 is occupied by a non-nginx process. Nothing changed."
 [ -z "$PORT443" ] || echo "$PORT443" | grep -q nginx || die "Port 443 is occupied by a non-nginx process. Nothing changed."
-
 have_cmd nginx || die "nginx is not installed. Nothing downloaded."
 have_cmd certbot || die "certbot is not installed. Nothing downloaded."
 
@@ -77,11 +75,10 @@ systemctl reload nginx
 echo "[6/10] Obtaining/checking TLS certificate..."
 CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
 KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
 if [ -f "$CERT" ] && [ -f "$KEY" ]; then
   echo "Existing Babyphone certificate found; no certificate download."
 else
-  certbot certonly     --webroot     -w "$ACME_WEBROOT"     --non-interactive     --agree-tos     --keep-until-expiring     -d "$DOMAIN"
+  certbot certonly --webroot -w "$ACME_WEBROOT" --non-interactive --agree-tos --keep-until-expiring -d "$DOMAIN"
   [ -f "$CERT" ] && [ -f "$KEY" ] || die "Certbot did not create the expected certificate."
 fi
 
@@ -200,12 +197,15 @@ EOF
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 echo "[8/10] Installing only missing npm dependency..."
+NPM_CLI_JS="$NODE20_DIR/node_modules/npm/bin/npm-cli.js"
 if [ -d "$APP_DIR/node_modules/ws" ]; then
   echo "Existing ws dependency found; no npm download."
+elif [ -r "$NPM_CLI_JS" ]; then
+  echo "ws is missing; running npm CLI directly with Node 20..."
+  "$NODE20_BIN" "$NPM_CLI_JS" --prefix "$APP_DIR" install --omit=dev
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 else
-  NPM_BIN="$NODE20_DIR/npm"
-  [ -x "$NPM_BIN" ] || die "Node 20 npm not found at $NPM_BIN."
-  sudo -u "$APP_USER" env PATH="$NODE20_DIR:/usr/local/bin:/usr/bin:/bin" "$NPM_BIN" install --omit=dev
+  die "Node 20 npm CLI was not found at $NPM_CLI_JS."
 fi
 
 cat > "$SYSTEMD_UNIT" <<EOF
