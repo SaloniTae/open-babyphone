@@ -28,12 +28,12 @@ import kotlinx.coroutines.flow.asStateFlow
 data class PendingConnection(
     val address: String = "",
     val port: Int = 0,
-    val relaySessionId: String? = null,
     val name: String,
     val pairingCode: CharArray?,
     val expectedChildId: String? = null,
     val expectedPairingId: String? = null,
-    val rememberAfterAuthentication: Boolean = false
+    val rememberAfterAuthentication: Boolean = false,
+    val relaySessionId: String? = null
 ) {
     init {
         require((address.isBlank()) == (port == 0))
