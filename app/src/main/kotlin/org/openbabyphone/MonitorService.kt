@@ -195,6 +195,16 @@ class MonitorService : Service() {
             return false
         }
 
+        if (socket is WebSocketByteStreamSocket) {
+            Thread {
+                socket.awaitClosed(Long.MAX_VALUE)
+                clientManager.removeClient(client)
+            }.apply {
+                name = "BabyphoneRelayClientWatch"
+                isDaemon = true
+            }.start()
+        }
+
         val clientCount = clientManager.getClientCount()
         val sessionActive = synchronized(sessionStateLock) {
             if (!isWorkerActive(claim)) {
