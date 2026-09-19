@@ -173,6 +173,8 @@ class WebSocketByteStreamSocket(
         closed.countDown()
     }
 
+    fun awaitClosed(timeoutMs: Long): Boolean = closed.await(timeoutMs, TimeUnit.MILLISECONDS)
+
     override fun isClosed(): Boolean = isClosed.get()
     override fun isConnected(): Boolean = webSocket != null && !isClosed.get()
 
