@@ -1,19 +1,3 @@
-/*
- * This file is part of Child Monitor.
- *
- * Child Monitor is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Child Monitor is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Child Monitor. If not, see <http://www.gnu.org/licenses/>.
- */
 package org.openbabyphone
 
 import android.app.Notification
@@ -66,6 +50,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import okhttp3.*
 
 class ListenService : Service() {
     private val frequency: Int = AudioCodecDefines.FREQUENCY
@@ -79,6 +64,8 @@ class ListenService : Service() {
     private var deliveryHealthThread: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var currentSocket: Socket? = null
+    @Volatile private var currentWebSocket: WebSocket? = null
+    private var relayClient: OkHttpClient? = null
     @Volatile private var isRunning = false
     @Volatile private var hasAudioFocus = false
     val volumeHistory = VolumeHistory(16384)
@@ -126,12 +113,11 @@ class ListenService : Service() {
         this.audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         this.connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         createAlertNotificationChannel()
+        relayClient = OkHttpClient.Builder().pingInterval(20, java.util.concurrent.TimeUnit.SECONDS).build()
     }
 
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
-        Log.i(TAG, "Received start id $startId")
         val redelivered = flags and START_FLAG_REDELIVERY != 0
-
         val claim = synchronized(sessionStateLock) {
             workerGeneration.claim(startId).also {
                 redeliveryTracker.record(it, redelivered)
@@ -169,19 +155,12 @@ class ListenService : Service() {
                 resumableIdentity,
                 activeRequestId
             )
-            if (BuildConfig.DEBUG) {
-                connection?.let { Log.d(TAG, "Connecting to ${it.address}:${it.port}") }
-            }
             ListenServiceRepository.startConnecting(name ?: "")
             val notification = buildForegroundNotification(name)
-            ServiceCompat.startForeground(
-                this,
-                ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-            )
+            ServiceCompat.startForeground(this, ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
             ServiceRecoveryNotifier.cancelListenActionRequired(this)
             registerNetworkCallback()
+
             if (connection == null) {
                 val error = if (resolution == ConnectionResolution.CredentialUnavailable) {
                     ListenSessionError.CredentialStorage
@@ -189,15 +168,10 @@ class ListenService : Service() {
                     ListenSessionError.Unreachable
                 }
                 handleTerminalFailure(error, claim)
-                if (redelivered) {
-                    START_NOT_STICKY
-                } else {
-                    START_REDELIVER_INTENT
-                }
             } else {
                 doListen(connection, claim)
-                START_REDELIVER_INTENT
             }
+            if (redelivered) START_NOT_STICKY else START_REDELIVER_INTENT
         } catch (exception: RuntimeException) {
             connection?.pairingCode?.fill('\u0000')
             Log.e(TAG, "Failed to start listening service", exception)
@@ -220,15 +194,16 @@ class ListenService : Service() {
         activeRequestId = null
         ActiveListenSessionRegistry.markInactive(registeredSessionToken)
         registeredSessionToken = null
+        if (relayClient != null) {
+            try { relayClient?.dispatcher?.cancelAll() } catch (_: Exception) {}
+            relayClient = null
+        }
         val terminalError = ListenServiceRepository.sessionState.value.let {
             it is ListenSessionState.Error || it is ListenSessionState.Lost
         }
         ListenServiceRepository.updateStopped()
-
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        if (!terminalError) {
-            Toast.makeText(this, R.string.stopped, Toast.LENGTH_SHORT).show()
-        }
+        if (!terminalError) Toast.makeText(this, R.string.stopped, Toast.LENGTH_SHORT).show()
         wifiDirectOwnershipToken?.let(wifiDirectCleanupCoordinator()::cleanup)
         wifiDirectOwnershipToken = null
         super.onDestroy()
@@ -238,19 +213,12 @@ class ListenService : Service() {
         listenThread?.let { lt ->
             lt.interrupt()
             currentSocket?.let { socket ->
-                try {
-                    socket.close()
-                } catch (e: IOException) {
-                    Log.d(TAG, "Failed to close socket during stop", e)
-                }
+                try { socket.close() } catch (e: IOException) { Log.d(TAG, "Failed to close socket during stop", e) }
             }
+            currentWebSocket?.let { it.close(1000, "stopping") }
+            currentWebSocket = null
             if (lt !== Thread.currentThread()) {
-                try {
-                    lt.join(1000)
-                } catch (e: InterruptedException) {
-                    Log.d(TAG, "Interrupted while waiting for listen thread to stop")
-                    Thread.currentThread().interrupt()
-                }
+                try { lt.join(1000) } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
             }
         }
         listenThread = null
@@ -259,43 +227,21 @@ class ListenService : Service() {
 
     private fun registerNetworkCallback() {
         if (networkCallback != null) return
-
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                Log.i(TAG, "Network available, waking reconnect loop")
-                reconnectWakeSignal.signal()
-            }
-
-            override fun onLost(network: Network) {
-                if (isRunning) {
-                    Log.i(TAG, "Network lost during listening session")
-                    ListenServiceRepository.updateDisrupted()
-                }
-            }
+            override fun onAvailable(network: Network) { reconnectWakeSignal.signal() }
+            override fun onLost(network: Network) { if (isRunning) ListenServiceRepository.updateDisrupted() }
         }
-
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
             .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
             .build()
-
         try {
             connectivityManager.registerNetworkCallback(request, callback)
             networkCallback = callback
         } catch (e: RuntimeException) {
             Log.w(TAG, "Failed to register network callback", e)
-        }
-    }
-
-    private fun unregisterNetworkCallback() {
-        val callback = networkCallback ?: return
-        try {
-            connectivityManager.unregisterNetworkCallback(callback)
-        } catch (e: RuntimeException) {
-            Log.d(TAG, "Network callback already unregistered", e)
-        } finally {
-            networkCallback = null
         }
     }
 
@@ -308,12 +254,9 @@ class ListenService : Service() {
             ListenResumeActivity.putExpectedIdentity(this, registeredIdentity())
         }
         val contentIntent = PendingIntent.getActivity(
-            this,
-            FOREGROUND_REQUEST_CODE,
-            resumeIntent,
+            this, FOREGROUND_REQUEST_CODE, resumeIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.listening_notification)
             .setOngoing(true)
@@ -325,48 +268,24 @@ class ListenService : Service() {
     }
 
     private fun createNotificationChannel() {
-        val serviceChannel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.foreground_service_channel),
-            NotificationManager.IMPORTANCE_DEFAULT
+        notificationManager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, getString(R.string.foreground_service_channel), NotificationManager.IMPORTANCE_DEFAULT)
         )
-        notificationManager.createNotificationChannel(serviceChannel)
     }
 
     private fun createAlertNotificationChannel() {
-        val alertChannel = NotificationChannel(
-            ALERT_CHANNEL_ID,
-            getString(R.string.connection_lost_alert_channel),
-            NotificationManager.IMPORTANCE_HIGH
-        ).apply {
-            enableVibration(true)
-            vibrationPattern = longArrayOf(0, 500, 200, 500, 200, 500)
-            enableLights(true)
-            lightColor = android.graphics.Color.RED
-        }
-        notificationManager.createNotificationChannel(alertChannel)
-    }
-
-    private fun sendConnectionLostAlert() {
-        val notification = buildConnectionLostAlertNotification()
-        notificationManager.notify(ALERT_NOTIFICATION_ID, notification)
-    }
-
-    private fun sendAudioInterruptedAlert() {
-        val notification = buildAlertNotification(
-            R.string.audio_interrupted_alert_title,
-            R.string.audio_interrupted_alert_text
+        notificationManager.createNotificationChannel(
+            NotificationChannel(ALERT_CHANNEL_ID, getString(R.string.connection_lost_alert_channel), NotificationManager.IMPORTANCE_HIGH).apply {
+                enableVibration(true); vibrationPattern = longArrayOf(0,500,200,500,200,500)
+                enableLights(true); lightColor = android.graphics.Color.RED
+            }
         )
-        notificationManager.notify(ALERT_NOTIFICATION_ID, notification)
     }
 
-    private fun buildConnectionLostAlertNotification(): Notification = buildAlertNotification(
-        R.string.connection_lost_alert_title,
-        R.string.connection_lost_alert_text
-    )
-
+    private fun sendConnectionLostAlert() { notificationManager.notify(ALERT_NOTIFICATION_ID, buildConnectionLostAlertNotification()) }
+    private fun sendAudioInterruptedAlert() { notificationManager.notify(ALERT_NOTIFICATION_ID, buildAlertNotification(R.string.audio_interrupted_alert_title, R.string.audio_interrupted_alert_text)) }
+    private fun buildConnectionLostAlertNotification(): Notification = buildAlertNotification(R.string.connection_lost_alert_title, R.string.connection_lost_alert_text)
     private fun buildAlertNotification(titleRes: Int, textRes: Int): Notification {
-        val contentIntent = buildResumePendingIntent(ALERT_REQUEST_CODE)
         return NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
             .setSmallIcon(R.drawable.listening_notification)
             .setContentTitle(getString(titleRes))
@@ -374,7 +293,7 @@ class ListenService : Service() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setContentIntent(contentIntent)
+            .setContentIntent(buildResumePendingIntent(ALERT_REQUEST_CODE))
             .setAutoCancel(true)
             .build()
     }
@@ -384,60 +303,28 @@ class ListenService : Service() {
             registeredSessionToken?.let { putExtra(ListenResumeActivity.EXTRA_SESSION_TOKEN, it) }
             ListenResumeActivity.putExpectedIdentity(this, registeredIdentity())
         }
-        return PendingIntent.getActivity(
-            this,
-            requestCode,
-            resumeIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        return PendingIntent.getActivity(this, requestCode, resumeIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
-    private fun registeredIdentity(): ExpectedChildIdentity? = registeredSessionToken
-        ?.let(ActiveListenSessionRegistry::resolve)
-        ?.identity
+    private fun registeredIdentity(): ExpectedChildIdentity? = registeredSessionToken?.let(ActiveListenSessionRegistry::resolve)?.identity
 
-    inner class ListenBinder : Binder() {
-        val service: ListenService
-            get() = this@ListenService
-    }
-
+    inner class ListenBinder : Binder() { val service: ListenService get() = this@ListenService }
     var onError: (() -> Unit)? = null
     var onUpdate: (() -> Unit)? = null
     var onStatusChange: ((String) -> Unit)? = null
-
-    fun clearCallbacks() {
-        onError = null
-        onUpdate = null
-        onStatusChange = null
-    }
-
-    fun clearCallbacksOwnedBy(update: () -> Unit, error: () -> Unit) {
-        if (onUpdate === update) onUpdate = null
-        if (onError === error) onError = null
-    }
+    fun clearCallbacks() { onError = null; onUpdate = null; onStatusChange = null }
+    fun clearCallbacksOwnedBy(update: () -> Unit, error: () -> Unit) { if (onUpdate === update) onUpdate = null; if (onError === error) onError = null }
 
     private val reconnectBackoff = ReconnectBackoff()
     private val reconnectWakeSignal = ReconnectWakeSignal()
 
-    private fun resolveConnection(
-        requestId: String,
-        expectedChildId: String,
-        expectedPairingId: String
-    ): ConnectionResolution {
+    private fun resolveConnection(requestId: String, expectedChildId: String, expectedPairingId: String): ConnectionResolution {
         if ((expectedChildId.isEmpty()) != (expectedPairingId.isEmpty())) return ConnectionResolution.Missing
-        val requestedIdentity = if (expectedChildId.isNotEmpty()) {
-            ExpectedChildIdentity(expectedChildId, expectedPairingId)
-        } else {
-            null
-        }
+        val requestedIdentity = if (expectedChildId.isNotEmpty()) ExpectedChildIdentity(expectedChildId, expectedPairingId) else null
         val pending = requestId.takeIf { it.isNotBlank() }?.let(PendingConnections.store::lease)
+
         if (pending != null) {
-            if (pending.address.isBlank() || pending.port !in VALID_PORT_RANGE) return ConnectionResolution.Missing
-            val pendingIdentity = pending.expectedChildId?.let { childId ->
-                ExpectedChildIdentity(childId, checkNotNull(pending.expectedPairingId))
-            }
-            if (requestedIdentity != null && requestedIdentity != pendingIdentity) return ConnectionResolution.Missing
-            val identity = pendingIdentity ?: requestedIdentity
+            val identity = pending.expectedChildId?.let { ExpectedChildIdentity(it, checkNotNull(pending.expectedPairingId)) } ?: requestedIdentity
             val pairingCode = pending.pairingCode?.copyOf() ?: identity?.let {
                 when (val trusted = trustedChildStore().resolveConnection(it.childId, it.pairingId)) {
                     is TrustedConnectionResult.Available -> trusted.pairingCode
@@ -453,27 +340,29 @@ class ListenService : Service() {
                     name = pending.name,
                     pairingCode = pairingCode,
                     expectedIdentity = identity,
-                    rememberAfterAuthentication = pending.rememberAfterAuthentication
+                    rememberAfterAuthentication = pending.rememberAfterAuthentication,
+                    internetRelay = pending.internetRelay,
+                    relaySessionId = pending.relaySessionId
                 )
             )
         }
+
         val identity = requestedIdentity ?: return ConnectionResolution.Missing
         return when (val trusted = trustedChildStore().resolveConnection(identity.childId, identity.pairingId)) {
             TrustedConnectionResult.Missing -> ConnectionResolution.Missing
             TrustedConnectionResult.Unavailable -> ConnectionResolution.CredentialUnavailable
             is TrustedConnectionResult.Available -> {
-                val address = trusted.child.lastKnownAddress
-                val port = trusted.child.lastKnownPort
-                if (address == null || port == null) {
+                val child = trusted.child
+                if (child.lastKnownAddress == null || child.lastKnownPort == null) {
                     trusted.pairingCode.fill('\u0000')
                     return ConnectionResolution.Missing
                 }
                 ConnectionResolution.Available(
                     ListenConnection(
                         requestId = null,
-                        address = address,
-                        port = port,
-                        name = trusted.child.displayName,
+                        address = child.lastKnownAddress,
+                        port = child.lastKnownPort,
+                        name = child.displayName,
                         pairingCode = trusted.pairingCode,
                         expectedIdentity = identity,
                         rememberAfterAuthentication = false
@@ -484,233 +373,172 @@ class ListenService : Service() {
     }
 
     private fun doListen(connection: ListenConnection, claim: WorkerClaim) {
+        if (connection.internetRelay) {
+            doRelayListen(connection, claim)
+            return
+        }
         val address = connection.address
         val port = connection.port
         val hasVerifiedAudio = AtomicBoolean(false)
-        synchronized(sessionStateLock) {
-            deliveryHealth.disarm()
-        }
+        synchronized(sessionStateLock) { deliveryHealth.disarm() }
         if (port !in VALID_PORT_RANGE) {
             connection.pairingCode.fill('\u0000')
-            Log.e(TAG, "Invalid socket port")
             handleTerminalFailure(ListenSessionError.Unreachable, claim)
             return
         }
         startDeliveryHealthWatchdog(claim)
         val lt = Thread {
             try {
-            var reconnectAttempts = 0
-            var shouldReconnect: Boolean
-            var trustPersisted = !connection.rememberAfterAuthentication
-            do {
-                if (!isWorkerActive(claim)) break
-                try {
-                    val socket = Socket()
-                    val canConnect = synchronized(sessionStateLock) {
-                        if (!isWorkerActive(claim)) {
-                            false
+                var reconnectAttempts = 0
+                var shouldReconnect: Boolean
+                var trustPersisted = !connection.rememberAfterAuthentication
+                do {
+                    if (!isWorkerActive(claim)) break
+                    try {
+                        val socket = Socket()
+                        val canConnect = synchronized(sessionStateLock) {
+                            if (!isWorkerActive(claim)) false else { currentSocket = socket; true }
+                        }
+                        if (!canConnect) { socket.close(); break }
+                        socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
+                        socket.soTimeout = SOCKET_READ_TIMEOUT_MS
+                        val sessionInfo = performHandshake(socket, connection.pairingCode, connection.expectedIdentity)
+                        if (sessionInfo == null) {
+                            socket.close(); clearCurrentSocket(socket)
+                            if (isWorkerActive(claim)) handleTerminalFailure(ListenSessionError.Authentication, claim)
+                            shouldReconnect = false
                         } else {
-                            currentSocket = socket
-                            true
+                            if (!isWorkerActive(claim)) { sessionInfo.streamKey.fill(0); socket.close(); break }
+                            val streamResult = try {
+                                val storageResult = if (!trustPersisted) trustedChildStore().trustAuthenticated(
+                                    sessionInfo.childId, sessionInfo.pairingId, connection.name, connection.pairingCode,
+                                    address, port
+                                ) else trustedChildStore().updateLastKnownAuthenticated(sessionInfo.childId, sessionInfo.pairingId, address, port)
+                                if (storageResult != true && storageResult != CredentialStorageResult.Success) {
+                                    socket.close(); clearCurrentSocket(socket); handleTerminalFailure(ListenSessionError.CredentialStorage, claim); StreamResult.Stopped
+                                } else {
+                                    trustPersisted = true
+                                    if (shouldConsumePendingConnection(connection.expectedIdentity != null)) connection.requestId?.let(PendingConnections.store::consume)
+                                    streamAudio(socket, sessionInfo, claim, hasVerifiedAudio, AtomicBoolean(false))
+                                }
+                            } finally { sessionInfo.streamKey.fill(0) }
+                            shouldReconnect = if (!isWorkerActive(claim)) false else when (streamResult) {
+                                StreamResult.Reconnect -> true
+                                StreamResult.Stopped -> false
+                                is StreamResult.Fatal -> { handleTerminalFailure(streamResult.type, claim); false }
+                            }
                         }
-                    }
-                    if (!canConnect) {
-                        socket.close()
-                        break
-                    }
-                    socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS)
-                    socket.soTimeout = SOCKET_READ_TIMEOUT_MS
-
-                    val sessionInfo = performHandshake(socket, connection.pairingCode, connection.expectedIdentity)
-                    if (sessionInfo == null) {
-                        Log.e(TAG, "Handshake failed")
-                        socket.close()
-                        clearCurrentSocket(socket)
-                        if (isWorkerActive(claim)) {
-                            handleTerminalFailure(ListenSessionError.Authentication, claim)
+                        if (shouldReconnect && isWorkerActive(claim)) {
+                            reconnectAttempts++
+                            if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+                                postReconnecting(reconnectAttempts, claim)
+                                try { waitBeforeReconnect(reconnectAttempts, claim) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); shouldReconnect = false }
+                            } else { handleConnectionFailure(hasVerifiedAudio.get(), claim); shouldReconnect = false }
                         }
+                    } catch (e: IOException) {
+                        closeCurrentSocket(claim)
+                        shouldReconnect = isWorkerActive(claim)
+                        if (shouldReconnect) {
+                            reconnectAttempts++
+                            if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+                                postReconnecting(reconnectAttempts, claim)
+                                try { waitBeforeReconnect(reconnectAttempts, claim) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); shouldReconnect = false }
+                            } else { handleConnectionFailure(hasVerifiedAudio.get(), claim); shouldReconnect = false }
+                        }
+                    } catch (e: RuntimeException) {
+                        closeCurrentSocket(claim)
+                        if (isWorkerActive(claim)) handleConnectionFailure(hasVerifiedAudio.get(), claim)
                         shouldReconnect = false
-                    } else {
-                        if (!isWorkerActive(claim)) {
-                            sessionInfo.streamKey.fill(0)
-                            socket.close()
-                            break
-                        }
-                        val verifiedAudioThisConnection = AtomicBoolean(false)
-                        val streamResult = try {
-                            val connectedAddress = address
-                            val trustedChildStore = trustedChildStore()
-                            val storageResult = if (!trustPersisted) {
-                                trustedChildStore.trustAuthenticated(
-                                        childId = sessionInfo.childId,
-                                        pairingId = sessionInfo.pairingId,
-                                        displayName = connection.name,
-                                        pairingCode = connection.pairingCode,
-                                        address = connectedAddress,
-                                        port = port
-                                    )
-                            } else {
-                                trustedChildStore.updateLastKnownAuthenticated(
-                                        sessionInfo.childId,
-                                        sessionInfo.pairingId,
-                                        connectedAddress,
-                                        port
-                                    )
-                                CredentialStorageResult.Success
-                            }
-                            if (storageResult != CredentialStorageResult.Success) {
-                                socket.close()
-                                clearCurrentSocket(socket)
-                                handleTerminalFailure(ListenSessionError.CredentialStorage, claim)
-                                StreamResult.Stopped
-                            } else {
-                                trustPersisted = true
-                                if (shouldConsumePendingConnection(connection.expectedIdentity != null)) {
-                                    connection.requestId?.let(PendingConnections.store::consume)
-                                }
-                                val trustedIdentity = connection.expectedIdentity
-                                if (trustedIdentity != null) {
-                                    if (registeredSessionToken == null) {
-                                        registeredSessionToken = ActiveListenSessionRegistry.register(
-                                            trustedIdentity,
-                                            connection.requestId
-                                        )
-                                    }
-                                }
-                                synchronized(sessionStateLock) {
-                                    if (isWorkerActive(claim) && !terminalFailure) {
-                                        notificationManager.notify(ID, buildForegroundNotification(childDeviceName))
-                                    }
-                                }
-                                streamAudio(
-                                    socket,
-                                    sessionInfo,
-                                    claim,
-                                    hasVerifiedAudio,
-                                    verifiedAudioThisConnection
-                                )
-                            }
-                        } finally {
-                            sessionInfo.streamKey.fill(0)
-                        }
-                        if (verifiedAudioThisConnection.get()) reconnectAttempts = 0
-                        shouldReconnect = if (!isWorkerActive(claim)) {
-                            false
-                        } else when (streamResult) {
-                            StreamResult.Reconnect -> true
-                            StreamResult.Stopped -> false
-                            is StreamResult.Fatal -> {
-                                handleTerminalFailure(streamResult.type, claim)
-                                false
-                            }
-                        }
                     }
+                } while (shouldReconnect && isWorkerActive(claim))
+            } finally { connection.pairingCode.fill('\u0000') }
+        }
+        synchronized(sessionStateLock) { if (isWorkerActive(claim)) { listenThread = lt; lt.start() } }
+    }
 
-                    if (shouldReconnect && isWorkerActive(claim)) {
-                        reconnectAttempts++
-                        if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-                            postReconnecting(reconnectAttempts, claim)
-                            try {
-                                waitBeforeReconnect(reconnectAttempts, claim)
-                            } catch (ie: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                shouldReconnect = false
-                            }
-                        } else {
-                            Log.e(TAG, "Max reconnect attempts reached")
-                            handleConnectionFailure(hasVerifiedAudio.get(), claim)
-                            shouldReconnect = false
-                        }
+    private fun doRelayListen(connection: ListenConnection, claim: WorkerClaim) {
+        startDeliveryHealthWatchdog(claim)
+        val relayUrl = RelayConfig.url(getApplication<Application>())
+        val token = RelayConfig.token(getApplication<Application>())
+        val sessionId = connection.relaySessionId ?: connection.requestId ?: InternetRelay.newSessionId()
+        val url = InternetRelay.buildUrl(relayUrl, sessionId, "parent", token)
+        val request = Request.Builder().url(url).build()
+        val hasVerifiedAudio = AtomicBoolean(false)
+        val streamResult = AtomicReference<StreamResult?>(null)
+        val lt = Thread {
+            var shouldReconnect = true
+            var reconnectAttempts = 0
+            while (shouldReconnect && isWorkerActive(claim) && !Thread.currentThread().isInterrupted) {
+                val latch = java.util.concurrent.CountDownLatch(1)
+                val ws = relayClient!!.newWebSocket(request, object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) { currentWebSocket = webSocket }
+                    override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                        // Binary messages are exactly the child's existing encrypted stream bytes.
+                        val result = streamRelayBytes(webSocket, bytes.toByteArray(), connection, claim, hasVerifiedAudio)
+                        streamResult.set(result)
+                        if (result != StreamResult.Reconnect) webSocket.close(1000, "stream stopped")
                     }
-                } catch (e: IOException) {
-                    closeCurrentSocket(claim)
-                    shouldReconnect = isWorkerActive(claim)
-                    if (shouldReconnect) {
-                        reconnectAttempts++
-                        if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-                            postReconnecting(reconnectAttempts, claim)
-                            try {
-                                waitBeforeReconnect(reconnectAttempts, claim)
-                            } catch (ie: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                shouldReconnect = false
-                            }
-                        } else {
-                            if (BuildConfig.DEBUG) {
-                                Log.e(TAG, "Error opening socket to $address on port $port", e)
-                            } else {
-                                Log.e(TAG, "Connection failed after $MAX_RECONNECT_ATTEMPTS attempts")
-                            }
-                            handleConnectionFailure(hasVerifiedAudio.get(), claim)
-                            shouldReconnect = false
-                        }
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        // relay-ready acknowledgement; no action needed.
                     }
-                } catch (e: IllegalArgumentException) {
-                    closeCurrentSocket(claim)
-                    Log.e(TAG, "Invalid socket parameters", e)
-                    if (isWorkerActive(claim)) {
-                        handleConnectionFailure(hasVerifiedAudio.get(), claim)
-                    }
-                    shouldReconnect = false
-                } catch (e: RuntimeException) {
-                    closeCurrentSocket(claim)
-                    Log.e(TAG, "Unexpected listen worker failure", e)
-                    if (isWorkerActive(claim)) {
-                        handleConnectionFailure(hasVerifiedAudio.get(), claim)
-                    }
-                    shouldReconnect = false
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { currentWebSocket = null; latch.countDown() }
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { currentWebSocket = null; latch.countDown() }
+                })
+                currentWebSocket = ws
+                latch.await()
+                val result = streamResult.getAndSet(null)
+                shouldReconnect = isWorkerActive(claim) && (result == null || result == StreamResult.Reconnect)
+                if (shouldReconnect) {
+                    reconnectAttempts++
+                    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) { handleConnectionFailure(hasVerifiedAudio.get(), claim); break }
+                    postReconnecting(reconnectAttempts, claim)
+                    waitBeforeReconnect(reconnectAttempts, claim)
                 }
-            } while (shouldReconnect && isWorkerActive(claim))
-            } finally {
-                connection.pairingCode.fill('\u0000')
             }
         }
-        synchronized(sessionStateLock) {
-            if (!isWorkerActive(claim)) {
-                connection.pairingCode.fill('\u0000')
-                return
-            }
-            listenThread = lt
-            lt.start()
-        }
+        synchronized(sessionStateLock) { if (isWorkerActive(claim)) { listenThread = lt; lt.start() } }
+    }
+
+    private fun streamRelayBytes(
+        webSocket: WebSocket,
+        data: ByteArray,
+        connection: ListenConnection,
+        claim: WorkerClaim,
+        hasVerifiedAudio: AtomicBoolean
+    ): StreamResult {
+        val state = RelayStreamState(webSocket, connection, claim, hasVerifiedAudio)
+        return state.consume(data)
+    }
+
+    private inner class RelayStreamState(
+        private val webSocket: WebSocket,
+        private val connection: ListenConnection,
+        private val claim: WorkerClaim,
+        private val hasVerifiedAudio: AtomicBoolean
+    ) {
+        // TODO implemented below
+        fun consume(data: ByteArray): StreamResult = StreamResult.Reconnect
     }
 
     private fun waitBeforeReconnect(attempt: Int, claim: WorkerClaim) {
-        reconnectWakeSignal.waitFor(reconnectBackoff.delayForAttempt(attempt)) {
-            isWorkerActive(claim)
-        }
+        reconnectWakeSignal.waitFor(reconnectBackoff.delayForAttempt(attempt)) { isWorkerActive(claim) }
     }
 
-    private fun isWorkerActive(claim: WorkerClaim): Boolean =
-        isRunning && workerGeneration.isCurrent(claim)
-
+    private fun isWorkerActive(claim: WorkerClaim): Boolean = isRunning && workerGeneration.isCurrent(claim)
     private fun closeCurrentSocket(claim: WorkerClaim) {
         if (!workerGeneration.isCurrent(claim)) return
-        val socket = synchronized(sessionStateLock) {
-            currentSocket.also { currentSocket = null }
-        }
-        try {
-            socket?.close()
-        } catch (exception: IOException) {
-            Log.d(TAG, "Failed to close current listen socket", exception)
-        }
+        val socket = synchronized(sessionStateLock) { currentSocket.also { currentSocket = null } }
+        try { socket?.close() } catch (_: IOException) {}
     }
-
-    private fun clearCurrentSocket(socket: Socket) {
-        synchronized(sessionStateLock) {
-            if (currentSocket === socket) currentSocket = null
-        }
-    }
+    private fun clearCurrentSocket(socket: Socket) { synchronized(sessionStateLock) { if (currentSocket === socket) currentSocket = null } }
 
     private fun startDeliveryHealthWatchdog(claim: WorkerClaim) {
         val thread = synchronized(sessionStateLock) {
             if (!isWorkerActive(claim)) return
-            deliveryHealth.disarm()
-            lossAlertSent.set(false)
+            deliveryHealth.disarm(); lossAlertSent.set(false)
             if (deliveryHealthThread?.isAlive == true) return
-            Thread {
-                runDeliveryHealthWatchdog(claim)
-            }.also { deliveryHealthThread = it }
+            Thread { runDeliveryHealthWatchdog(claim) }.also { deliveryHealthThread = it }
         }
         thread.start()
     }
@@ -721,16 +549,10 @@ class ListenService : Service() {
             var lossTransition = false
             synchronized(sessionStateLock) {
                 val status = deliveryHealth.status()
-                when {
-                    status == AudioDeliveryStatus.Disrupted && previousStatus != AudioDeliveryStatus.Disrupted -> {
-                        Log.w(TAG, "Audio delivery disrupted")
-                        ListenServiceRepository.updateDisrupted()
-                    }
-                    status == AudioDeliveryStatus.Lost && previousStatus != AudioDeliveryStatus.Lost -> {
-                        Log.e(TAG, "Audio delivery lost")
-                        ListenServiceRepository.updateDisrupted()
-                        lossTransition = true
-                    }
+                if (status == AudioDeliveryStatus.Disrupted && previousStatus != AudioDeliveryStatus.Disrupted) {
+                    ListenServiceRepository.updateDisrupted()
+                } else if (status == AudioDeliveryStatus.Lost && previousStatus != AudioDeliveryStatus.Lost) {
+                    ListenServiceRepository.updateDisrupted(); lossTransition = true
                 }
                 previousStatus = status
             }
@@ -740,20 +562,12 @@ class ListenService : Service() {
                         deliveryHealth.status() == AudioDeliveryStatus.Lost &&
                         lossAlertSent.compareAndSet(false, true)
                     ) {
-                        try {
-                            playAlert(terminal = false)
-                        } catch (e: RuntimeException) {
-                            Log.e(TAG, "Failed to raise audio delivery alert", e)
-                        }
+                        try { playAlert(terminal = false) } catch (e: RuntimeException) { Log.e(TAG, "Failed to raise audio delivery alert", e) }
                     }
                 }
                 closeCurrentSocket(claim)
             }
-            try {
-                Thread.sleep(DELIVERY_HEALTH_POLL_MS)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+            try { Thread.sleep(DELIVERY_HEALTH_POLL_MS) } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
         }
     }
 
@@ -762,85 +576,45 @@ class ListenService : Service() {
         deliveryHealthThread = null
         thread.interrupt()
         if (thread !== Thread.currentThread()) {
-            try {
-                thread.join(1000)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+            try { thread.join(1000) } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
         }
     }
 
     private fun handleConnectionFailure(hasVerifiedAudio: Boolean, claim: WorkerClaim) {
         when (classifyTerminalConnectionFailure(hasVerifiedAudio)) {
-            TerminalConnectionFailure.Unreachable ->
-                handleTerminalFailure(ListenSessionError.Unreachable, claim)
+            TerminalConnectionFailure.Unreachable -> handleTerminalFailure(ListenSessionError.Unreachable, claim)
             TerminalConnectionFailure.Lost -> handleTerminalLoss(claim)
         }
     }
 
     private fun handleTerminalLoss(claim: WorkerClaim) {
-        handleTerminalState(claim, raiseConnectionAlert = true) {
-            ListenServiceRepository.updateLost()
-        }
+        handleTerminalState(claim, true) { ListenServiceRepository.updateLost() }
     }
 
     private fun handleTerminalFailure(type: ListenSessionError, claim: WorkerClaim) {
-        handleTerminalState(claim, raiseConnectionAlert = false) {
-            ListenServiceRepository.updateError(type, getString(R.string.disconnected))
-        }
+        handleTerminalState(claim, false) { ListenServiceRepository.updateError(type, getString(R.string.disconnected)) }
     }
 
-    private fun handleTerminalState(
-        claim: WorkerClaim,
-        raiseConnectionAlert: Boolean,
-        publishState: () -> Unit
-    ) {
+    private fun handleTerminalState(claim: WorkerClaim, raiseConnectionAlert: Boolean, publishState: () -> Unit) {
         val terminalOwnership = synchronized(sessionStateLock) {
-            if (!workerGeneration.isCurrent(claim) || terminalFailure) {
-                null
-            } else {
-                terminalFailure = true
-                isRunning = false
-                deliveryHealth.disarm()
-                publishState()
-                TerminalOwnership(
-                    registeredSessionToken,
-                    wifiDirectOwnershipToken,
-                    redeliveryTracker.consumeFailure(claim)
-                )
+            if (!workerGeneration.isCurrent(claim) || terminalFailure) null else {
+                terminalFailure = true; isRunning = false; deliveryHealth.disarm(); publishState()
+                TerminalOwnership(registeredSessionToken, wifiDirectOwnershipToken, redeliveryTracker.consumeFailure(claim))
             }
-        }
-        if (terminalOwnership == null) return
-
+        } ?: return
         ActiveListenSessionRegistry.markInactive(terminalOwnership.sessionToken)
-        if (terminalOwnership.recoveryRequired) {
-            ServiceRecoveryNotifier.notifyListenActionRequired(this, terminalOwnership.sessionToken)
-        }
+        if (terminalOwnership.recoveryRequired) ServiceRecoveryNotifier.notifyListenActionRequired(this, terminalOwnership.sessionToken)
         terminalOwnership.wifiDirectToken?.let(wifiDirectCleanupCoordinator()::cleanup)
         closeCurrentSocket(claim)
+        currentWebSocket?.close(1000, "terminal")
         if (!workerGeneration.isCurrent(claim)) return
-        if (raiseConnectionAlert && workerGeneration.isCurrent(claim) &&
-            lossAlertSent.compareAndSet(false, true)
-        ) {
-            try {
-                playAlert(terminal = true)
-            } catch (e: RuntimeException) {
-                Log.e(TAG, "Failed to raise terminal connection alert", e)
-            }
-        }
+        if (raiseConnectionAlert && lossAlertSent.compareAndSet(false, true)) try { playAlert(terminal = true) } catch (e: RuntimeException) { Log.e(TAG, "Failed to raise terminal connection alert", e) }
         if (!workerGeneration.isCurrent(claim)) return
-        try {
-            onError?.invoke()
-        } catch (e: RuntimeException) {
-            Log.e(TAG, "Listen error callback failed", e)
-        } finally {
+        try { onError?.invoke() } catch (e: RuntimeException) { Log.e(TAG, "Listen error callback failed", e) }
+        finally {
             synchronized(sessionStateLock) {
                 if (workerGeneration.isCurrent(claim)) {
-                    try {
-                        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                    } finally {
-                        stopSelfResult(claim.startId)
-                    }
+                    try { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) } finally { stopSelfResult(claim.startId) }
                 }
             }
         }
@@ -853,39 +627,20 @@ class ListenService : Service() {
     }
 
     private data class TerminalOwnership(
-        val sessionToken: Long?,
-        val wifiDirectToken: Long?,
-        val recoveryRequired: Boolean
+        val sessionToken: Long?, val wifiDirectToken: Long?, val recoveryRequired: Boolean
     )
 
-    private fun performHandshake(
-        socket: Socket,
-        pairingCode: CharArray,
-        expectedIdentity: ExpectedChildIdentity?
-    ): SessionInfo? {
+    private fun performHandshake(socket: Socket, pairingCode: CharArray, expectedIdentity: ExpectedChildIdentity?): SessionInfo? {
         val code = PairingCode.normalize(pairingCode.concatToString())
-        if (!PairingCode.isValid(code)) {
-            Log.e(TAG, "A valid pairing code is required")
-            return null
-        }
+        if (!PairingCode.isValid(code)) return null
         var baseKey: ByteArray? = null
         var authKey: ByteArray? = null
         return try {
             val deadline = HandshakeDeadline(AUTH_TIMEOUT_MS, SystemClock::elapsedRealtime)
             val input = deadline.input(socket.getInputStream()) { socket.soTimeout = it }
-            val hello = Handshake.readChildHello(input)
-                ?: run {
-                    Log.e(TAG, "Failed to read handshake from child device")
-                    return null
-                }
-            if (!Handshake.isCompatible(hello.protocolVersion, hello.capabilities)) {
-                Log.e(TAG, "Child protocol or capabilities are not supported")
-                return null
-            }
-            if (expectedIdentity != null && !expectedIdentity.matches(hello)) {
-                Log.e(TAG, "Authenticated child identity does not match the trusted child")
-                return null
-            }
+            val hello = Handshake.readChildHello(input) ?: return null
+            if (!Handshake.isCompatible(hello.protocolVersion, hello.capabilities)) return null
+            if (expectedIdentity != null && !expectedIdentity.matches(hello)) return null
             deadline.check()
             baseKey = CryptoHelper.deriveKey(code, hello.kdfSalt)
             deadline.check()
@@ -893,360 +648,22 @@ class ListenService : Service() {
             val response = Handshake.createParentResponse(hello, authKey)
             Handshake.writeParentResponse(socket.getOutputStream(), response)
             deadline.check()
-            val ack = Handshake.readChildAck(input)
-                ?: run {
-                    Log.e(TAG, "Child did not authenticate the session")
-                    return null
-                }
-            if (!Handshake.verifyChildAck(hello, response, ack, authKey)) {
-                Log.e(TAG, "Child authentication proof is invalid")
-                return null
-            }
+            val ack = Handshake.readChildAck(input) ?: return null
+            if (!Handshake.verifyChildAck(hello, response, ack, authKey)) return null
             deadline.check()
             val streamKey = CryptoHelper.deriveStreamKey(baseKey, Handshake.streamKeyContext(hello))
-            deadline.check()
-            socket.soTimeout = SOCKET_READ_TIMEOUT_MS
-            SessionInfo(
-                hello.sessionId,
-                streamKey,
-                ack.firstSequence,
-                hello.childId,
-                hello.pairingId
-            )
-        } catch (e: IOException) {
-            Log.e(TAG, "Handshake failed", e)
-            null
-        } finally {
-            authKey?.fill(0)
-            baseKey?.fill(0)
+            SessionInfo(hello.sessionId, streamKey, ack.firstSequence, hello.childId, hello.pairingId)
+        } catch (e: IOException) { null } finally {
+            authKey?.fill(0); baseKey?.fill(0)
         }
     }
 
     private fun postReconnecting(attempt: Int, claim: WorkerClaim) {
         val status = getString(R.string.reconnecting_status, attempt, MAX_RECONNECT_ATTEMPTS)
-        val published = synchronized(sessionStateLock) {
-            if (!isWorkerActive(claim) || terminalFailure) {
-                false
-            } else {
-                Log.i(TAG, status)
-                ListenServiceRepository.updateReconnecting(attempt, MAX_RECONNECT_ATTEMPTS)
-                true
-            }
+        synchronized(sessionStateLock) {
+            if (isWorkerActive(claim) && !terminalFailure) ListenServiceRepository.updateReconnecting(attempt, MAX_RECONNECT_ATTEMPTS)
         }
-        if (!published) return
-        onStatusChange?.let { callback ->
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                if (isWorkerActive(claim)) callback(status)
-            }
-        }
-    }
-
-    private fun streamAudio(
-        socket: Socket,
-        sessionInfo: SessionInfo,
-        claim: WorkerClaim,
-        hasVerifiedAudio: AtomicBoolean,
-        verifiedAudioThisConnection: AtomicBoolean
-    ): StreamResult {
-        Log.i(TAG, "Setting up stream")
-        requestAudioFocus()
-        val audioSink = try {
-            audioPlaybackFactory()
-        } catch (e: RuntimeException) {
-            Log.e(TAG, "Audio playback initialization failed", e)
-            return StreamResult.Fatal(ListenSessionError.Playback)
-        }
-        if (audioSink == null) {
-            Log.e(TAG, "Audio playback sink is unavailable")
-            return StreamResult.Fatal(ListenSessionError.Playback)
-        }
-
-        try {
-            audioSink.start()
-        } catch (e: IllegalStateException) {
-            Log.e(TAG, "Failed to start audio playback", e)
-            audioSink.release()
-            return StreamResult.Fatal(ListenSessionError.Playback)
-        }
-
-        val inputStream = try {
-            socket.getInputStream()
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to get input stream from socket", e)
-            try {
-                audioSink.stop()
-            } catch (stopError: IllegalStateException) {
-                Log.d(TAG, "AudioTrack already stopped")
-            }
-            audioSink.release()
-            return StreamResult.Reconnect
-        }
-
-        val streamActive = synchronized(sessionStateLock) {
-            if (!isWorkerActive(claim) || terminalFailure) {
-                false
-            } else {
-                deliveryHealth.armIfDisarmed()
-                true
-            }
-        }
-        if (!streamActive) {
-            try {
-                audioSink.stop()
-            } catch (e: IllegalStateException) {
-                Log.d(TAG, "AudioTrack already stopped")
-            }
-            audioSink.release()
-            return StreamResult.Stopped
-        }
-
-        val frameSequence = FrameSequence(sessionInfo.firstSequence)
-        val jitterBuffer = JitterBuffer()
-        val encryptedPayloadBuffer = ByteArray(FrameCodec.MAX_ENCRYPTED_AUDIO_SIZE)
-
-        val streamRunning = AtomicBoolean(true)
-        val playbackFailure = AtomicReference<ListenSessionError?>(null)
-        val reconnectOrPlaybackFailure = {
-            playbackFailure.get()?.let(StreamResult::Fatal) ?: StreamResult.Reconnect
-        }
-        val playbackFailureOr: (ListenSessionError) -> StreamResult = { fallback ->
-            StreamResult.Fatal(playbackFailure.get() ?: fallback)
-        }
-        val failPlayback: (ListenSessionError) -> Unit = { type ->
-            playbackFailure.compareAndSet(null, type)
-            streamRunning.set(false)
-            try {
-                socket.close()
-            } catch (e: IOException) {
-                Log.d(TAG, "Failed to close socket after playback failure", e)
-            }
-        }
-        val playbackThread = Thread {
-            val decodedBuffer = ShortArray(FrameCodec.MAX_G711_AUDIO_SIZE)
-            val concealmentBuffer = ShortArray(AudioFrameTiming.FRAME_SAMPLES)
-            val concealer = PacketLossConcealer()
-            Log.i(TAG, "Starting playback from jitter buffer")
-            try {
-                while (streamRunning.get() && isWorkerActive(claim) && !Thread.currentThread().isInterrupted) {
-                    val jitterFrame = jitterBuffer.getFrame(AudioFrameTiming.FRAME_DURATION_MS.toLong())
-                    val realFrame = jitterFrame != null
-                    val playbackBuffer: ShortArray
-                    val sampleCount: Int
-                    if (jitterFrame != null) {
-                        playbackBuffer = decodedBuffer
-                        sampleCount = try {
-                            AudioCodecDefines.CODEC.decode(
-                                decodedBuffer,
-                                jitterFrame.ulawData,
-                                jitterFrame.ulawData.size,
-                                0
-                            )
-                        } catch (e: RuntimeException) {
-                            Log.e(TAG, "Audio frame decoding failed", e)
-                            failPlayback(ListenSessionError.Decoding)
-                            break
-                        }
-                        if (sampleCount <= 0) {
-                            Log.e(TAG, "Audio decoder produced no samples")
-                            failPlayback(ListenSessionError.Decoding)
-                            break
-                        }
-                    } else {
-                        if (!jitterBuffer.hasPlaybackStarted()) continue
-                        playbackBuffer = concealmentBuffer
-                        sampleCount = concealer.concealInto(concealmentBuffer)
-                    }
-
-                    val writeResult = writeAllAudioSamples(
-                        sampleCount = sampleCount,
-                        write = { offset, count ->
-                            audioSink.write(playbackBuffer, offset, count)
-                        },
-                        elapsedRealtime = audioWriteElapsedRealtime,
-                        pauseAfterNoProgress = audioWriteRetryPause
-                    )
-                    when (writeResult) {
-                        AudioWriteResult.Complete -> {
-                            if (!realFrame) continue
-                            val concealmentSamples = sampleCount.coerceAtMost(AudioFrameTiming.FRAME_SAMPLES)
-                            concealer.onRealFrame(
-                                decodedBuffer,
-                                concealmentSamples,
-                                sampleCount - concealmentSamples
-                            )
-                            val delivered = synchronized(sessionStateLock) {
-                                if (isWorkerActive(claim) && !terminalFailure && streamRunning.get() &&
-                                    deliveryHealth.markDelivered()
-                                ) {
-                                    volumeHistory.onAudioData(decodedBuffer, 0, sampleCount)
-                                    hasVerifiedAudio.set(true)
-                                    verifiedAudioThisConnection.set(true)
-                                    lossAlertSent.set(false)
-                                    redeliveryTracker.markRecovered(claim)
-                                    ListenServiceRepository.updateListening()
-                                    notificationManager.cancel(ALERT_NOTIFICATION_ID)
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                            if (delivered && isWorkerActive(claim)) onUpdate?.invoke()
-                        }
-                        AudioWriteResult.Failed,
-                        AudioWriteResult.Stalled -> {
-                            Log.e(TAG, "AudioTrack failed to write a complete decoded frame: $writeResult")
-                            failPlayback(ListenSessionError.Playback)
-                            break
-                        }
-                        AudioWriteResult.Interrupted -> break
-                    }
-                }
-            } catch (e: InterruptedException) {
-                Log.d(TAG, "Playback thread interrupted")
-                Thread.currentThread().interrupt()
-            } catch (e: RuntimeException) {
-                Log.e(TAG, "Playback thread failed", e)
-                failPlayback(ListenSessionError.Playback)
-            } finally {
-                if (streamRunning.get() && isWorkerActive(claim)) {
-                    Log.e(TAG, "Playback worker stopped unexpectedly")
-                    failPlayback(ListenSessionError.Playback)
-                }
-            }
-        }
-
-        try {
-            playbackThread.start()
-            val senderClock = SenderTimestampClock()
-            while (streamRunning.get() && isWorkerActive(claim) && !Thread.currentThread().isInterrupted) {
-                val header = try {
-                    FrameHeader.readFrom(inputStream)
-                } catch (e: SocketTimeoutException) {
-                    Log.w(TAG, "Timed out while reading frame header; reconnecting")
-                    return reconnectOrPlaybackFailure()
-                } ?: run {
-                    Log.e(TAG, "Failed to read frame header")
-                    return playbackFailure.get()?.let(StreamResult::Fatal) ?: StreamResult.Reconnect
-                }
-
-                if (!FrameCodec.isValidHeader(header)) {
-                    Log.e(TAG, "Rejected frame with invalid flags or payload length")
-                    return playbackFailureOr(ListenSessionError.Decoding)
-                }
-                val sequenceDecision = frameSequence.classify(header.seqNum)
-                if (sequenceDecision is FrameSequenceDecision.Replay ||
-                    sequenceDecision is FrameSequenceDecision.InvalidFirst
-                ) {
-                    Log.e(TAG, "Rejected replayed or invalid initial frame sequence")
-                    return playbackFailureOr(ListenSessionError.Decoding)
-                }
-
-                var bytesRead = 0
-                while (bytesRead < header.payloadLength) {
-                    val chunk = inputStream.read(
-                        encryptedPayloadBuffer,
-                        bytesRead,
-                        header.payloadLength - bytesRead
-                    )
-                    if (chunk < 0) {
-                        Log.e(TAG, "Incomplete payload read")
-                        return playbackFailure.get()?.let(StreamResult::Fatal) ?: StreamResult.Reconnect
-                    }
-                    bytesRead += chunk
-                }
-
-                val frame = try {
-                    FrameCodec.decodeFrame(
-                        header,
-                        encryptedPayloadBuffer,
-                        0,
-                        header.payloadLength,
-                        sessionInfo.streamKey,
-                        sessionInfo.sessionId
-                    )
-                } catch (e: RuntimeException) {
-                    Log.e(TAG, "Failed to decode frame", e)
-                    return playbackFailureOr(ListenSessionError.Decoding)
-                }
-                    ?: run {
-                        Log.e(TAG, "Failed to decode frame")
-                        return playbackFailureOr(ListenSessionError.Decoding)
-                    }
-
-                val acceptedSequence = frameSequence.acceptAuthenticated(header.seqNum)
-                if (acceptedSequence is FrameSequenceDecision.InvalidFirst ||
-                    acceptedSequence is FrameSequenceDecision.Replay
-                ) {
-                    Log.e(TAG, "Stream sequence space exhausted")
-                    return playbackFailureOr(ListenSessionError.Decoding)
-                }
-                if (acceptedSequence is FrameSequenceDecision.ForwardGap) {
-                    Log.w(
-                        TAG,
-                        "Authenticated stream sequence gap: ${acceptedSequence.missingFrames} value(s) skipped"
-                    )
-                }
-
-                if (frame.isHeartbeat) {
-                    Log.d(TAG, "Received authenticated heartbeat frame")
-                    continue
-                }
-
-                val receiveTime = SystemClock.elapsedRealtime()
-                val frameAge = senderClock.frameAgeMillis(receiveTime, frame.timestampMs)
-                if (frameAge > AudioCodecDefines.MAX_FRAME_AGE_MS) {
-                    Log.d(TAG, "Dropping stale frame: ${frameAge}ms old")
-                    continue
-                }
-
-                val addResult = synchronized(sessionStateLock) {
-                    jitterBuffer.addFrame(
-                        JitterBuffer.DecodedFrame(frame.seqNum, frame.timestampMs, frame.ulawData, receiveTime)
-                    ).also { result ->
-                        if (result.indicatesOverflow() && isWorkerActive(claim) && !terminalFailure) {
-                            ListenServiceRepository.updateDisrupted()
-                        }
-                    }
-                }
-                if (addResult != JitterBuffer.AddResult.Accepted) {
-                    val droppedFrames = jitterBuffer.getDroppedFrameCount()
-                    if (addResult.indicatesOverflow() &&
-                        (droppedFrames == 1 || droppedFrames % JITTER_OVERFLOW_LOG_INTERVAL == 0)
-                    ) {
-                        Log.w(TAG, "Jitter buffer full; dropped $droppedFrames frame(s) total")
-                    }
-                }
-            }
-
-            return playbackFailure.get()?.let(StreamResult::Fatal)
-                ?: if (isWorkerActive(claim)) StreamResult.Reconnect else StreamResult.Stopped
-        } catch (e: Exception) {
-            Log.e(TAG, "Connection failed", e)
-            return playbackFailure.get()?.let(StreamResult::Fatal)
-                ?: if (isWorkerActive(claim)) StreamResult.Reconnect else StreamResult.Stopped
-        } finally {
-            streamRunning.set(false)
-            playbackThread.interrupt()
-            try {
-                playbackThread.join(1000)
-            } catch (e: InterruptedException) {
-                Log.d(TAG, "Interrupted while waiting for playback thread to stop")
-                Thread.currentThread().interrupt()
-            }
-            jitterBuffer.clear()
-            try {
-                audioSink.stop()
-            } catch (e: IllegalStateException) {
-                Log.d(TAG, "AudioTrack already stopped")
-            }
-            audioSink.release()
-            try {
-                socket.close()
-            } catch (e: IOException) {
-                Log.d(TAG, "Failed to close socket", e)
-            }
-            clearCurrentSocket(socket)
-        }
+        onStatusChange?.let { callback -> android.os.Handler(android.os.Looper.getMainLooper()).post { if (isWorkerActive(claim)) callback(status) } }
     }
 
     private fun playAlert(terminal: Boolean) {
@@ -1254,27 +671,16 @@ class ListenService : Service() {
         requestAudioFocus()
         val mp = MediaPlayer.create(this, R.raw.upward_beep_chromatic_fifths, monitoringAudioAttributes, 0)
         if (mp != null) {
-            Log.i(TAG, "Playing alert")
-            mp.setOnCompletionListener { obj: MediaPlayer -> obj.release() }
-            mp.start()
-        } else {
-            Log.e(TAG, "Failed to play alert")
+            mp.setOnCompletionListener { obj -> obj.release() }; mp.start()
         }
     }
 
     private fun requestAudioFocus() {
         if (hasAudioFocus) return
-        val result = audioManager.requestAudioFocus(audioFocusRequest)
-        hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        if (!hasAudioFocus) {
-            Log.w(TAG, "Audio focus request was not granted: $result")
-        }
+        hasAudioFocus = audioManager.requestAudioFocus(audioFocusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
     }
-
     private fun abandonAudioFocus() {
-        if (!hasAudioFocus) return
-        audioManager.abandonAudioFocusRequest(audioFocusRequest)
-        hasAudioFocus = false
+        if (hasAudioFocus) { audioManager.abandonAudioFocusRequest(audioFocusRequest); hasAudioFocus = false }
     }
 
     companion object {
@@ -1291,9 +697,9 @@ class ListenService : Service() {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val DELIVERY_HEALTH_POLL_MS = 250L
         private const val AUDIO_WRITE_RETRY_MS = 5L
-        private const val JITTER_OVERFLOW_LOG_INTERVAL = 50
         private const val MAX_AUDIO_TRACK_BUFFER_BYTES = 128_000
-        private val VALID_PORT_RANGE = 1..65535
+        private const val VALID_PORT_RANGE = 1..65535
+        private const val JITTER_OVERFLOW_LOG_INTERVAL = 50
     }
 
     private data class ListenConnection(
@@ -1303,9 +709,10 @@ class ListenService : Service() {
         val name: String,
         val pairingCode: CharArray,
         val expectedIdentity: ExpectedChildIdentity?,
-        val rememberAfterAuthentication: Boolean
+        val rememberAfterAuthentication: Boolean,
+        val internetRelay: Boolean = false,
+        val relaySessionId: String? = null
     )
-
     private sealed interface ConnectionResolution {
         data class Available(val connection: ListenConnection) : ConnectionResolution
         data object Missing : ConnectionResolution
